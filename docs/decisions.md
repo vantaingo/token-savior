@@ -2,6 +2,18 @@
 
 Decisions taken without validating them with the user, so they can be challenged later.
 
+### 2026-10-05 — Follow the worktree: fix the path routing first, then wire a hook
+
+Goal (user request): each time Claude creates a worktree to work on an issue, token-savior
+switches to it without any manual step. Plan: (1) fix `resolve()` so a forward-slash path hint
+reaches the worktree (this change, issue #6); (2) run the MCP server from this fork's checkout,
+because the released 4.21.0 has no worktree routing at all; (3) a user-level `PostToolUse` hook on
+`EnterWorktree|ExitWorktree` of type `mcp_tool` calling `switch_project` with `${cwd}`.
+Why a hook and not server-side roots handling: Claude Code does not document
+`roots/list_changed` on `EnterWorktree`, and this server ignores that notification today.
+Why `os.altsep` and not normalizing the hint first: the fix stays a one-line condition on the
+branch that already existed, and `abspath` normalization was already applied right before it.
+
 ### 2026-10-05 — Fix the two reported bugs in the fork only
 
 The user asked to fix upstream issues Mibayy/token-savior#119 and #120 "in my fork only". They

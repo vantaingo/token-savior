@@ -146,6 +146,36 @@ class TestResolvePathHints:
         assert err == ""
         assert slot.root == wt
 
+    def test_forward_slash_worktree_hint_resolves_worktree(self, tmp_path):
+        """Hooks, JSON configs and most tools write paths with `/`. On Windows
+        that skipped the path branch and the project name found inside the
+        hint (reverse containment) silently returned the PARENT repo."""
+        repo, wt = _repo_with_nested_worktree(tmp_path)
+        mgr = SlotManager(cache_version=2)
+        mgr.register_roots([repo])
+        slot, err = mgr.resolve(wt.replace(os.sep, "/"))
+        assert err == ""
+        assert slot.root == wt
+
+    def test_forward_slash_parent_hint_still_exact_matches(self, tmp_path):
+        repo, wt = _repo_with_nested_worktree(tmp_path)
+        mgr = SlotManager(cache_version=2)
+        mgr.register_roots([repo])
+        mgr.resolve_path(os.path.join(wt, "src", "mod.py"))  # worktree now registered too
+        slot, err = mgr.resolve(repo.replace(os.sep, "/"))
+        assert err == ""
+        assert slot.root == repo
+
+    def test_forward_slash_subdir_hint_resolves_owner(self, tmp_path):
+        repo, _wt = _repo_with_nested_worktree(tmp_path)
+        mgr = SlotManager(cache_version=2)
+        mgr.register_roots([repo])
+        sub = os.path.join(repo, "src").replace(os.sep, "/")
+        slot, err = mgr.resolve(sub)
+        assert err == ""
+        assert slot.root == repo
+        assert os.path.join(repo, "src") not in mgr.projects
+
     def test_subdir_hint_resolves_owner_not_itself(self, tmp_path):
         """Before: a real-but-unregistered subdirectory got registered as a
         project of its own. Now it routes to the project that owns it."""

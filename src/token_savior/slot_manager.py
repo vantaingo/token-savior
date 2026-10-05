@@ -395,7 +395,10 @@ class SlotManager:
             # fuzzing. `repo/.claude/worktrees/wt` must reach the worktree
             # slot, and a subdirectory of a registered project must resolve
             # to that project — not get registered as a project of its own.
-            if os.sep in project_hint:
+            # Both separators count: on Windows `/` is accepted (hooks and JSON
+            # configs write it), and a hint holding only `/` used to skip this
+            # branch and match the PARENT repo by name containment below.
+            if any(sep and sep in project_hint for sep in (os.sep, os.altsep)):
                 slot = self.resolve_path(hint_abs)
                 if slot is not None:
                     return slot, ""
