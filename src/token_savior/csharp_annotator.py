@@ -186,7 +186,8 @@ _TYPE_RE = re.compile(
     r"(?:<[^>]*>)?"  # optional generic params
     r"(?:\s*\([^)]*\))?"  # optional positional record params
     r"(?:\s*:\s*([^{;]+?))?"  # optional base list
-    r"\s*(?:\{|;|where\s)"  # opening brace, semicolon, or where clause
+    # opening brace, semicolon, where clause, or end of line (Allman: the brace is on the next line)
+    r"\s*(?:\{|;|where\s|(?://.*)?$)"
 )
 
 # Method/constructor: [modifiers] ReturnType Name<T>(params) { or => or ;
