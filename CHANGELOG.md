@@ -38,6 +38,27 @@ surface asked for a symbol name.
   declaration; `_find_type_end` already handled the next-line brace. Still not
   covered: positional records whose parameter list spans several lines, and
   properties.
+- **C# has a dependency graph.** `csharp_annotator` returned no
+  `dependency_graph`, and C# `using` lines name namespaces, not types, so the
+  project-level pass that scans bodies for imported names had nothing to match.
+  C# methods were therefore not even nodes of the global graph:
+  `get_call_chain` answered "not found in dependency graph" for names
+  `find_symbol` resolved, and callers, impact, dead code and entry points were
+  empty. The annotator now emits candidate edges per method — same-class and
+  inherited calls, `base.X()`, `new T(...)`, calls through fields, properties,
+  parameters, primary-constructor parameters and typed locals, static calls,
+  `is` / `as` / `typeof` — and the global graph keeps those that name a project
+  symbol. An interface method call also reaches its implementations, through
+  the same hierarchy pass Java uses. Comments and string literals are blanked
+  first. `_CACHE_VERSION` goes 3 → 4 so cached `.cs` metadata is rebuilt. Not
+  covered: nested types, extension methods, `using static` and alias
+  resolution, overload resolution by arity, lambdas, expression-bodied
+  properties and interpolated-string holes.
+- **An ambiguous function name lists its candidates.** `function 'X' is
+  ambiguous` said nothing about where to look, which is the normal case for an
+  interface method and its implementation. The error now carries `candidates`
+  (qualified name and file) and a `_suggestion`, as the class-ambiguity error
+  already did.
 
 ## Unreleased — One server, many worktrees, no stolen calls
 

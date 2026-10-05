@@ -98,6 +98,18 @@ def _resolve_unique_function(functions, name: str):
     return None, "ambiguous"
 
 
+def _ambiguous_function_result(name: str, candidates: list[tuple[str, str]]) -> dict:
+    """Ambiguity error that names each candidate (qualified name + file)."""
+    result: dict = {
+        "name": name,
+        "error": f"function '{name}' is ambiguous; use a fully qualified signature",
+    }
+    if candidates:
+        result["candidates"] = [{"name": qn, "file": path} for qn, path in candidates[:10]]
+        result["_suggestion"] = f"pass one of the qualified names, e.g. '{candidates[0][0]}'."
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Single-file query functions
 # ---------------------------------------------------------------------------
@@ -3309,13 +3321,13 @@ class ProjectQueryEngine:
                 if want_functions:
                     func, error = _resolve_unique_function(meta.functions, name)
                     if error == "ambiguous":
-                        return {
-                            "name": name,
-                            "error": (
-                                f"function '{name}' is ambiguous; "
-                                "use a fully qualified signature"
-                            ),
-                        }
+                        return _ambiguous_function_result(
+                            name,
+                            [
+                                (f.qualified_name, path)
+                                for f in _find_matching_functions(meta.functions, name)
+                            ],
+                        )
                     if func is not None:
                         return _strip(self._func_result(func, path, meta, level=level))
                 if want_classes and len(homonymes) <= 1:
@@ -3332,10 +3344,13 @@ class ProjectQueryEngine:
             if want_functions:
                 func, error = _resolve_unique_function(meta.functions, name)
                 if error == "ambiguous":
-                    return {
-                        "name": name,
-                        "error": f"function '{name}' is ambiguous; use a fully qualified signature",
-                    }
+                    return _ambiguous_function_result(
+                        name,
+                        [
+                            (f.qualified_name, path)
+                            for f in _find_matching_functions(meta.functions, name)
+                        ],
+                    )
                 if func is not None:
                     candidate_results.append(
                         _strip(self._func_result(func, path, meta, level=level))
@@ -3367,10 +3382,10 @@ class ProjectQueryEngine:
         if len(candidate_results) == 1:
             return candidate_results[0]
         if len(candidate_results) > 1:
-            return {
-                "name": name,
-                "error": f"function '{name}' is ambiguous; use a fully qualified signature",
-            }
+            # E.g. an interface method and its implementation, in two files.
+            return _ambiguous_function_result(
+                name, [(c.get("name", name), c.get("file", "")) for c in candidate_results]
+            )
         # Cross-language partial fallback via normalized-name index.
         norm_idx = getattr(index, "normalized_symbol_index", None) or {}
         if norm_idx:

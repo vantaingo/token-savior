@@ -72,3 +72,33 @@ the first pull request first; the second then shows only its own commits.
 
 The surrounding tests and comments are in French; the user's rule says every file is written in
 English, so new tests, comments and this file follow the rule and not the local habit.
+
+### 2026-10-05 — #4: C# graph from regexes, edges as candidates resolved globally
+
+No tree-sitter grammar is wired for C# here (the annotator is regex based, unlike Java), so the
+graph is built from regexes over the method bodies, with comments and string literals blanked
+first. The annotator cannot see other files, so it emits *candidate* names (`Type`, `Type.Method`)
+and relies on the global pass (`_resolve_java_dependency_symbols`, which runs for every language) to
+drop the ones that name no project symbol. That avoids a second resolution layer; the price is that
+the per-file `dependency_graph` of a `.cs` file lists names that exist nowhere (`Task`,
+`Console`), which is also what the Java annotator does for unresolved receivers.
+
+The interface -> implementation edge is not built in the annotator: the existing pass
+(`_build_java_implementation_edges`, applied to every file) already matches methods by short name
+through `base_classes`, and it works for C# because it keys on `cls.name`.
+
+### 2026-10-05 — #4: ambiguous function names list candidates, they do not pick one
+
+Point 3 of the issue suggested resolving an interface/implementation pair to the implementation
+"or listing both". Listing both was chosen: preferring the implementation would hide the interface
+and be wrong for abstract and base classes, and the qualified name (`Type.Method`) already
+resolves. The error keeps its text and gains `candidates` and `_suggestion`.
+
+### 2026-10-05 — #4: scope left out
+
+Not covered, to keep the change reviewable: nested types (the annotator still skips them),
+extension methods, `using static` and alias resolution, overload resolution by arity (overloads
+share one graph node), lambdas and delegates, expression-bodied properties, and the holes of
+interpolated strings (the string is blanked whole). Attribute names are not added as class edges
+(the plan said so; dropped, they are noise on `[Obsolete]`-style attributes and no project symbol
+is reached through them). `_CACHE_VERSION` is bumped to 4: cached `.cs` metadata has no graph.

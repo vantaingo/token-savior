@@ -91,7 +91,7 @@ def __getattr__(name):
 # Persistent cache versioning
 # ---------------------------------------------------------------------------
 
-_CACHE_VERSION: int = 3  # Bumped: StructuralMetadata.variables + ProjectIndex.variable_table
+_CACHE_VERSION: int = 4  # Bumped: C# annotator now fills dependency_graph (was 3: variables + variable_table)
 
 # ---------------------------------------------------------------------------
 # Project state — slot manager owns the project dict and active root
