@@ -28,6 +28,16 @@ surface asked for a symbol name.
   failed precisely where the need is most common, and the next hint-less call
   silently answered from the wrong repository. Default behaviour is unchanged
   (promotion still happens with the flag off).
+- **C# types declared with Allman braces are indexed.** `_TYPE_RE` required
+  `{`, `;` or `where` on the declaration line, so a `class` / `struct` /
+  `interface` / `enum` / `record` whose opening brace sits on the next line —
+  the default .NET style, and what `dotnet new` generates — was missing from
+  the index, and its methods surfaced as top-level functions
+  (`find_symbol` answered "not found", `get_function_source` rendered a
+  Python-style stub). End of line, optionally after a `//` comment, now ends a
+  declaration; `_find_type_end` already handled the next-line brace. Still not
+  covered: positional records whose parameter list spans several lines, and
+  properties.
 
 ## Unreleased — One server, many worktrees, no stolen calls
 
