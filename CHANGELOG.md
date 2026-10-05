@@ -93,6 +93,13 @@ spawn cwd carries its signal.
 - `_ARG_ALIASES` and `_normalize_arguments` were defined twice in `server.py`;
   schemas were built from the first copy and dispatch used the second, which
   alone knew `find_symbol(query=...)`. One copy remains.
+- **Path hints written with `/` reach the right project on Windows.**
+  `SlotManager.resolve` only treated a hint as a path when it held `os.sep`,
+  which is `\` on Windows. `switch_project("C:/dev/repo/.claude/worktrees/wt")`
+  therefore skipped the owning-project routing, and the repo name found inside
+  the hint (reverse containment) silently answered with the *parent* checkout:
+  `Already active 'repo'`, the worktree never indexed. `os.altsep` now counts
+  too. Hooks and JSON configs write `/`, so this was the common spelling.
 
 ## v4.21.0 — The server stops keeping what it knows to itself (2026-07-28)
 
