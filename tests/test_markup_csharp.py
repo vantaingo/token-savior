@@ -1,5 +1,7 @@
 """Tests for the regex-based C# annotator."""
 
+import pytest
+
 from token_savior.annotator import annotate
 from token_savior.csharp_annotator import annotate_csharp
 
@@ -469,6 +471,65 @@ class TestCSharpComplexFile:
         assert len(get_user) == 1
         assert "HttpGet" in get_user[0].decorators
         assert get_user[0].docstring is not None
+
+
+class TestCSharpAllmanBraces:
+    """Types whose opening brace sits on the next line (Allman, the .NET default)."""
+
+    ALLMAN = "namespace N;\npublic class Foo\n{\n    public int Bar(int x)\n    {\n        return x;\n    }\n}\n"
+    KR = "namespace N;\npublic class Foo {\n    public int Bar(int x) {\n        return x;\n    }\n}\n"
+
+    @pytest.mark.parametrize("src", [ALLMAN, KR], ids=["allman", "k&r"])
+    def test_class_and_method_detected_in_both_styles(self, src):
+        meta = annotate_csharp(src)
+        assert [c.name for c in meta.classes] == ["Foo"]
+        assert [f.qualified_name for f in meta.functions] == ["Foo.Bar"]
+        bar = meta.functions[0]
+        assert bar.is_method
+        assert bar.parent_class == "Foo"
+
+    def test_allman_and_kr_give_the_same_line_ranges_shape(self):
+        allman = annotate_csharp(self.ALLMAN).classes[0]
+        assert allman.line_range.start == 2
+        assert allman.line_range.end == 8
+
+    @pytest.mark.parametrize(
+        "decl,name",
+        [
+            ("public struct Point", "Point"),
+            ("public interface IThing", "IThing"),
+            ("public enum Color", "Color"),
+            ("public record class Employee", "Employee"),
+            ("public sealed partial class Widget", "Widget"),
+        ],
+    )
+    def test_every_type_kind(self, decl, name):
+        meta = annotate_csharp(f"{decl}\n{{\n}}\n")
+        assert [c.name for c in meta.classes] == [name]
+
+    def test_base_list_on_declaration_line(self):
+        meta = annotate_csharp("public class Foo : Bar, IBaz\n{\n}\n")
+        assert meta.classes[0].base_classes == ["Bar", "IBaz"]
+
+    def test_generic_with_where_clause_on_next_line(self):
+        src = "public class Repo<T>\n    where T : class\n{\n    public void Save(T item)\n    {\n    }\n}\n"
+        meta = annotate_csharp(src)
+        assert [c.name for c in meta.classes] == ["Repo"]
+        assert [f.qualified_name for f in meta.functions] == ["Repo.Save"]
+
+    def test_nested_allman_type_is_not_a_toplevel_function(self):
+        src = (
+            "public class Outer\n{\n    public class Inner\n    {\n"
+            "        public void Hidden()\n        {\n        }\n    }\n\n"
+            "    public void Visible()\n    {\n    }\n}\n"
+        )
+        meta = annotate_csharp(src)
+        assert [c.name for c in meta.classes] == ["Outer"]
+        assert [f.name for f in meta.functions if f.parent_class == "Outer"] == ["Visible"]
+
+    def test_trailing_comment_on_declaration_line(self):
+        meta = annotate_csharp("public class Foo // the foo\n{\n}\n")
+        assert [c.name for c in meta.classes] == ["Foo"]
 
 
 class TestCSharpAnnotatorDispatch:

@@ -79,3 +79,6 @@ memory-backup-*.json
 
 # Personal operator layer lives in /root/token-savior-brain (private)
 world/
+
+# Scratch files (agents)
+/tmp/
