@@ -102,3 +102,24 @@ share one graph node), lambdas and delegates, expression-bodied properties, and 
 interpolated strings (the string is blanked whole). Attribute names are not added as class edges
 (the plan said so; dropped, they are noise on `[Obsolete]`-style attributes and no project symbol
 is reached through them). `_CACHE_VERSION` is bumped to 4: cached `.cs` metadata has no graph.
+
+### 2026-10-05 — #9: drop bare names and siblings from call-chain matching, keep the class expansion
+
+`get_call_chain` matched targets through `_function_aliases`, whose bare `func.name` is shared by
+every class that has a method of that name, and through `_get_symbol_graph_aliases`, which made a
+target stand for its whole class. Both are removed for methods, in `query_api.py` only; the bare
+name is kept when it is itself a node of the graph (Go keys its graph by bare names), and a
+constructor still stands for its class (an edge to `T` is a `new T()`).
+`_function_aliases` is left alone because `find_symbol` resolves short names through it.
+
+Not changed, deliberately: a class reached on the way is still expanded to all its methods
+(`_get_call_chain_neighbors`, and the class branch of `_resolve_graph_candidate_names`). That is
+what lets `A.run -> B` continue into `B`'s methods, and the Java chains rely on it; narrowing it
+changes Java results and needs its own issue. Consequence: a caller that only depends on type `B`
+can still be shown reaching any method of `B`.
+
+### 2026-10-05 — Editing tools on Windows rewrote line endings
+
+The repository is LF. `replace_symbol_source` and Python's `write_text` both left files in CRLF
+(a 7 441-line diff for a 19-line change). Normalised back to LF at the byte level before
+committing; check `git diff --stat` after such edits.
