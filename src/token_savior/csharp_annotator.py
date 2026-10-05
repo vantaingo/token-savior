@@ -594,6 +594,174 @@ def _should_skip_pass2(stripped: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Dependency graph (regex based, best-effort)
+#
+# Edges are *candidate* names (``Type.Method`` / ``Type``). Names that are not
+# defined anywhere in the project are dropped when the global graph is built,
+# so cross-file targets can be emitted without knowing the other files here.
+# ---------------------------------------------------------------------------
+
+# Comments, char literals and string literals are blanked before scanning so
+# that names mentioned in them do not create edges.
+_NOISE_RE = re.compile(
+    r"//[^\n]*"
+    r"|/\*.*?\*/"
+    r"|'(?:[^'\\\n]|\\.)'"
+    r'|\$?@"(?:[^"]|"")*"'
+    r'|@\$"(?:[^"]|"")*"'
+    r'|\$?"(?:[^"\\\n]|\\.)*"',
+    re.DOTALL,
+)
+# "Type name" followed by a declaration terminator: fields, properties,
+# parameters, locals, foreach variables and pattern variables.
+_DECL_RE = re.compile(
+    r"(?<![\w.])([A-Z][\w.]*(?:<[^;=(){}]*>)?\??(?:\[[\s,]*\])*)"
+    r"\s+([A-Za-z_]\w*)\s*(?==|;|,|\)|\{|\bin\b)"
+)
+_VAR_NEW_RE = re.compile(r"\bvar\s+(\w+)\s*=\s*(?:await\s+)?new\s+([A-Z][\w.]*)")
+_NEW_RE = re.compile(r"\bnew\s+([A-Z][\w.]*)")
+_BARE_CALL_RE = re.compile(r"(?<![\w.])(new\s+)?(\w+)\s*(?:<[^<>()]*>)?\s*\(")
+_CHAIN_CALL_RE = re.compile(r"(?<![\w.])(\w+(?:\.\w+)+)\s*(?:<[^<>()]*>)?\s*\(")
+_STATIC_HEAD_RE = re.compile(r"(?<![\w.])([A-Z]\w*)\s*\.\s*\w")
+_TYPE_REF_RE = re.compile(
+    r"\b(?:is|as)\s+(?:not\s+)?([A-Z][\w.]*)"
+    r"|\btypeof\s*\(\s*([A-Z][\w.]*)"
+    r"|<\s*([A-Z][\w.]*)"
+)
+_BASE_CALL_RE = re.compile(r"\bbase\s*\.\s*(\w+)\s*\(")
+_THIS_RE = re.compile(r"\bthis\s*\.\s*")
+_NULL_COND_RE = re.compile(r"\?\s*\.")
+
+
+def _csharp_base_type(raw: str) -> str | None:
+    """Reduce ``Ns.Task<Foo>[]?`` to ``Task``; None for primitives / lowercase names."""
+    name = re.sub(r"\[[\s,]*\]", "", raw.strip()).split("<", 1)[0].rstrip("?")
+    name = name.rsplit(".", 1)[-1]
+    return name if name[:1].isupper() else None
+
+
+def _declared_types(text: str) -> dict[str, str]:
+    """Map variable / member / parameter name -> declared type name found in ``text``."""
+    found: dict[str, str] = {}
+    for m in _DECL_RE.finditer(text):
+        type_name = _csharp_base_type(m.group(1))
+        if type_name:
+            found.setdefault(m.group(2), type_name)
+    for m in _VAR_NEW_RE.finditer(text):
+        type_name = _csharp_base_type(m.group(2))
+        if type_name:
+            found.setdefault(m.group(1), type_name)
+    return found
+
+
+def _class_member_types(
+    lines: list[str], cls: ClassInfo, methods: list[FunctionInfo]
+) -> dict[str, str]:
+    """Types of the fields, properties and primary-constructor parameters of a type."""
+    method_lines: set[int] = set()
+    for method in methods:
+        method_lines.update(range(method.line_range.start, method.line_range.end + 1))
+    member_text = "\n".join(
+        lines[n - 1]
+        for n in range(cls.line_range.start, cls.line_range.end + 1)
+        if n not in method_lines
+    )
+    return _declared_types(_NOISE_RE.sub(" ", member_text))
+
+
+def _csharp_function_deps(
+    func: FunctionInfo,
+    lines: list[str],
+    bases: dict[str, list[str]],
+    methods_by_class: dict[str | None, set[str]],
+    members: dict[str, dict[str, str]],
+) -> set[str]:
+    text = _NOISE_RE.sub(" ", "\n".join(lines[func.line_range.start - 1 : func.line_range.end]))
+    owner = func.parent_class
+    owner_bases = bases.get(owner, []) if owner else []
+    locals_by_name = _declared_types(text)
+    var_types = {**members.get(owner, {}), **locals_by_name} if owner else dict(locals_by_name)
+    deps: set[str] = set()
+
+    def add_member(type_name: str, member: str) -> None:
+        deps.add(type_name)
+        deps.add(f"{type_name}.{member}")
+
+    # base.Method(): the base types only, never the overriding method itself.
+    for m in _BASE_CALL_RE.finditer(text):
+        for base in owner_bases:
+            add_member(base, m.group(1))
+    text = _BASE_CALL_RE.sub(lambda m: f"__base__.{m.group(1)}(", text)
+    text = _NULL_COND_RE.sub(".", _THIS_RE.sub("", text))
+
+    own_methods = methods_by_class.get(owner, set())
+    for m in _BARE_CALL_RE.finditer(text):
+        is_new, name = m.group(1), m.group(2)
+        if is_new or name in _NOT_METHOD_NAMES:
+            continue
+        if owner is None:
+            deps.add(name)
+        elif name in own_methods:
+            deps.add(f"{owner}.{name}")
+        else:
+            for base in owner_bases:
+                deps.add(f"{base}.{name}")
+
+    for m in _NEW_RE.finditer(text):
+        type_name = _csharp_base_type(m.group(1))
+        if type_name:
+            add_member(type_name, type_name)  # the type and its constructor
+
+    for m in _CHAIN_CALL_RE.finditer(text):
+        segments = m.group(1).split(".")
+        head, member = segments[0], segments[-1]
+        if head in var_types:
+            if len(segments) == 2:
+                add_member(var_types[head], member)
+        elif head[:1].isupper() and segments[-2][:1].isupper():
+            add_member(segments[-2], member)  # static call, possibly namespace-qualified
+
+    for m in _STATIC_HEAD_RE.finditer(text):
+        if m.group(1) not in var_types:
+            deps.add(m.group(1))
+    deps.update(locals_by_name.values())
+    for m in _TYPE_REF_RE.finditer(text):
+        type_name = _csharp_base_type(next(g for g in m.groups() if g))
+        if type_name:
+            deps.add(type_name)
+
+    deps.discard(func.qualified_name)
+    if owner:
+        deps.discard(owner)
+    return deps
+
+
+def _build_csharp_dependency_graph(
+    lines: list[str], classes: list[ClassInfo], functions: list[FunctionInfo]
+) -> dict[str, list[str]]:
+    """Name -> candidate dependencies, keyed like the symbol table (``Type.Method``, ``Type``)."""
+    bases = {cls.name: cls.base_classes for cls in classes}
+    methods_by_class: dict[str | None, set[str]] = {}
+    for func in functions:
+        methods_by_class.setdefault(func.parent_class, set()).add(func.name)
+    members = {
+        cls.name: _class_member_types(
+            lines, cls, [f for f in functions if f.parent_class == cls.name]
+        )
+        for cls in classes
+    }
+
+    graph: dict[str, set[str]] = {}
+    for cls in classes:
+        graph.setdefault(cls.name, set()).update(b for b in cls.base_classes if b != cls.name)
+    for func in functions:
+        graph.setdefault(func.qualified_name, set()).update(
+            _csharp_function_deps(func, lines, bases, methods_by_class, members)
+        )
+    return {name: sorted(deps) for name, deps in graph.items()}
+
+
+# ---------------------------------------------------------------------------
 # Main annotator
 # ---------------------------------------------------------------------------
 
@@ -675,4 +843,5 @@ def annotate_csharp(source: str, source_name: str = "<source>") -> StructuralMet
         functions=functions,
         classes=classes,
         imports=imports,
+        dependency_graph=_build_csharp_dependency_graph(lines, classes, functions),
     )
