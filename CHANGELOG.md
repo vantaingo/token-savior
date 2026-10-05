@@ -54,6 +54,18 @@ surface asked for a symbol name.
   covered: nested types, extension methods, `using static` and alias
   resolution, overload resolution by arity, lambdas, expression-bodied
   properties and interpolated-string holes.
+- **`get_call_chain` no longer links same-name methods of unrelated classes.**
+  Found by the first real C# repo to run #4: `SqliteDeliveryStore.CaptureAsync`
+  calls its own private `OpenAsync`, and the chain still ended in
+  `SqliteNotificationRepository.OpenAsync`. The graph was right; the search
+  was not. Every method matched through its bare name (`OpenAsync`), so two
+  classes with a private helper of the same name were the same node, and the
+  target also stood for all the sibling methods of its class. A method's bare
+  name now stands for it only when the graph is itself keyed by bare names
+  (Go, top-level functions), and only a constructor stands for its class.
+  Applies to every language. Still over-approximate: a class met on the way is
+  expanded to all its methods, so `A.run` that merely depends on type `B` can
+  still be shown reaching any `B` method.
 - **An ambiguous function name lists its candidates.** `function 'X' is
   ambiguous` said nothing about where to look, which is the normal case for an
   interface method and its implementation. The error now carries `candidates`

@@ -1850,3 +1850,31 @@ def test_hints_off_respects_profile_and_explicit_override(monkeypatch):
     monkeypatch.setenv("TS_NO_HINTS", "1")
     monkeypatch.setenv("TOKEN_SAVIOR_PROFILE", "full")
     assert _hints_off() is True
+
+
+class TestCallChainSameNameMethods:
+    """Issue #9: a bare method name shared by two classes must not link them."""
+
+    def test_python_close_methods_of_unrelated_classes_are_not_confused(self, tmp_path):
+        from token_savior.project_indexer import ProjectIndexer
+
+        (tmp_path / "pool.py").write_text(
+            "class Pool:\n"
+            "    def close(self):\n"
+            "        pass\n"
+        )
+        (tmp_path / "session.py").write_text(
+            "class Session:\n"
+            "    def close(self):\n"
+            "        pass\n"
+            "\n"
+            "    def finish(self):\n"
+            "        self.close()\n"
+        )
+        index = ProjectIndexer(str(tmp_path)).index()
+        engine = ProjectQueryEngine(index)
+
+        assert "close" not in engine._resolve_graph_candidate_names("Session.close")
+        assert "close" not in engine._get_graph_target_names("Pool.close")
+        result = engine.get_call_chain("Session.finish", "Pool.close")
+        assert "chain" not in result, result

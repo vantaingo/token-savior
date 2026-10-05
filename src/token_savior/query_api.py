@@ -3516,9 +3516,13 @@ class ProjectQueryEngine:
         if parent_class is None:
             return aliases
 
-        if any(method.qualified_name == qualified_name for method in parent_class.methods):
+        # Reaching a sibling method does not reach this method, so only a
+        # constructor stands for its class (an edge to `T` is a `new T()`).
+        method_name = qualified_name.rsplit(".", 1)[1].split("(", 1)[0]
+        if method_name == parent_name.rsplit(".", 1)[-1] and any(
+            method.qualified_name == qualified_name for method in parent_class.methods
+        ):
             aliases.add(parent_name)
-            aliases.update(method.qualified_name for method in parent_class.methods)
         return aliases
 
     def _get_graph_target_names(self, resolved_name: str) -> set[str]:
@@ -3599,7 +3603,13 @@ class ProjectQueryEngine:
             candidates.add(base_name)
         for meta in self.index.files.values():
             for func in _find_matching_functions(meta.functions, name):
-                candidates.update(_function_aliases(func))
+                aliases = _function_aliases(func)
+                # The bare name of a method is shared by every class that has
+                # one (`OpenAsync` in two unrelated classes); it only stands
+                # for the method when the graph itself is keyed by bare names.
+                if func.is_method and func.name != name and not self._is_graph_node(func.name):
+                    aliases.discard(func.name)
+                candidates.update(aliases)
             for cls in meta.classes:
                 qualified_name = cls.qualified_name or cls.name
                 if name in {cls.name, qualified_name} or qualified_name.endswith(f".{name}"):
@@ -3616,6 +3626,9 @@ class ProjectQueryEngine:
             if _graph_name_matches(symbol, name):
                 candidates.add(symbol)
         return candidates
+
+    def _is_graph_node(self, name: str) -> bool:
+        return name in self.index.global_dependency_graph or name in self.index.reverse_dependency_graph
 
     def _has_forward_graph_presence(self, qualified_name: str) -> bool:
         if qualified_name in self.index.global_dependency_graph:
