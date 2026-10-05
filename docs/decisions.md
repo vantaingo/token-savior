@@ -123,3 +123,13 @@ can still be shown reaching any method of `B`.
 The repository is LF. `replace_symbol_source` and Python's `write_text` both left files in CRLF
 (a 7 441-line diff for a 19-line change). Normalised back to LF at the byte level before
 committing; check `git diff --stat` after such edits.
+
+### 2026-10-05 — #13: generic names in public fixtures, history left as is
+
+The fork is public. Test fixtures and CHANGELOG lines written for #4 / #9 reused class and member
+names from the private codebase where the bugs were seen; they are renamed to generic ones
+(`Worker`, `IRepository`, `SqlRepository`, `Store`, `GetMaxIdAsync`, `ScanAsync`). Issue, PR and
+comment texts were rewritten the same way and the user deletes the old revisions in the web UI.
+Rule from now on: anything posted to a public repository is anonymized before posting. The user
+chose not to rewrite `main` history: the earlier commits and the PR #8 / #10 diffs keep the old
+names (a force-push would not purge `refs/pull`, only GitHub support can).

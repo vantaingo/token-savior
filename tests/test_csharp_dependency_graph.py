@@ -9,20 +9,20 @@ from token_savior.project_indexer import ProjectIndexer
 from token_savior.query_api import ProjectQueryEngine, create_project_query_functions
 
 REPOSITORY_INTERFACE = """\
-namespace Notifications;
+namespace App;
 
-public interface INotificationRepository
+public interface IRepository
 {
-    Task<long> GetMaxSequenceIdAsync(CancellationToken ct);
+    Task<long> GetMaxIdAsync(CancellationToken ct);
 }
 """
 
 REPOSITORY_IMPL = """\
-namespace Notifications;
+namespace App;
 
-public sealed class SqliteNotificationRepository : INotificationRepository
+public sealed class SqlRepository : IRepository
 {
-    public async Task<long> GetMaxSequenceIdAsync(CancellationToken ct)
+    public async Task<long> GetMaxIdAsync(CancellationToken ct)
     {
         using var connection = await OpenAsync(ct);
         return 0;
@@ -36,37 +36,37 @@ public sealed class SqliteNotificationRepository : INotificationRepository
 """
 
 WORKER_FIELD = """\
-namespace Notifications;
+namespace App;
 
-public sealed class NotificationWorker
+public sealed class Worker
 {
-    private readonly INotificationRepository _repository;
+    private readonly IRepository _repository;
 
-    public NotificationWorker(INotificationRepository repository)
+    public Worker(IRepository repository)
     {
         _repository = repository;
     }
 
     public async Task ExecuteAsync(CancellationToken ct)
     {
-        await DiscoverAsync(ct);
+        await ScanAsync(ct);
     }
 
-    private async Task DiscoverAsync(CancellationToken ct)
+    private async Task ScanAsync(CancellationToken ct)
     {
-        var max = await _repository.GetMaxSequenceIdAsync(ct);
+        var max = await _repository.GetMaxIdAsync(ct);
     }
 }
 """
 
 WORKER_PRIMARY_CTOR = """\
-namespace Notifications;
+namespace App;
 
-public sealed class NotificationWorker(INotificationRepository repository)
+public sealed class Worker(IRepository repository)
 {
-    public async Task DiscoverAsync(CancellationToken ct)
+    public async Task ScanAsync(CancellationToken ct)
     {
-        var max = await repository.GetMaxSequenceIdAsync(ct);
+        var max = await repository.GetMaxIdAsync(ct);
     }
 }
 """
@@ -79,9 +79,9 @@ def _write(path, content: str) -> None:
 
 def _project(root, worker: str = WORKER_FIELD):
     root.mkdir()
-    _write(root / "INotificationRepository.cs", REPOSITORY_INTERFACE)
-    _write(root / "SqliteNotificationRepository.cs", REPOSITORY_IMPL)
-    _write(root / "NotificationWorker.cs", worker)
+    _write(root / "IRepository.cs", REPOSITORY_INTERFACE)
+    _write(root / "SqlRepository.cs", REPOSITORY_IMPL)
+    _write(root / "Worker.cs", worker)
     idx = ProjectIndexer(str(root)).index()
     return idx, create_project_query_functions(idx)
 
@@ -89,17 +89,17 @@ def _project(root, worker: str = WORKER_FIELD):
 class TestPerFileGraph:
     def test_same_class_call_edge(self):
         graph = annotate_csharp(WORKER_FIELD).dependency_graph
-        assert "NotificationWorker.DiscoverAsync" in graph["NotificationWorker.ExecuteAsync"]
+        assert "Worker.ScanAsync" in graph["Worker.ExecuteAsync"]
 
     def test_field_typed_call_edge(self):
         graph = annotate_csharp(WORKER_FIELD).dependency_graph
-        deps = graph["NotificationWorker.DiscoverAsync"]
-        assert "INotificationRepository.GetMaxSequenceIdAsync" in deps
+        deps = graph["Worker.ScanAsync"]
+        assert "IRepository.GetMaxIdAsync" in deps
 
     def test_primary_constructor_parameter_call_edge(self):
         graph = annotate_csharp(WORKER_PRIMARY_CTOR).dependency_graph
-        deps = graph["NotificationWorker.DiscoverAsync"]
-        assert "INotificationRepository.GetMaxSequenceIdAsync" in deps
+        deps = graph["Worker.ScanAsync"]
+        assert "IRepository.GetMaxIdAsync" in deps
 
     def test_object_creation_edge(self):
         source = """\
@@ -166,63 +166,63 @@ class TestPerFileGraph:
 class TestGlobalGraph:
     def test_worker_depends_on_interface_and_implementation(self, tmp_path):
         idx, _ = _project(tmp_path / "cs")
-        deps = idx.global_dependency_graph["NotificationWorker.DiscoverAsync"]
-        assert "INotificationRepository.GetMaxSequenceIdAsync" in deps
-        assert "SqliteNotificationRepository.GetMaxSequenceIdAsync" in deps
+        deps = idx.global_dependency_graph["Worker.ScanAsync"]
+        assert "IRepository.GetMaxIdAsync" in deps
+        assert "SqlRepository.GetMaxIdAsync" in deps
 
     def test_unknown_external_names_are_dropped(self, tmp_path):
         idx, _ = _project(tmp_path / "cs")
-        deps = idx.global_dependency_graph["SqliteNotificationRepository.OpenAsync"]
+        deps = idx.global_dependency_graph["SqlRepository.OpenAsync"]
         assert not any(dep.startswith(("Task", "CancellationToken")) for dep in deps)
 
     def test_get_call_chain_through_interface_dispatch(self, tmp_path):
         _, funcs = _project(tmp_path / "cs")
         result = funcs["get_call_chain"](
-            "NotificationWorker.DiscoverAsync",
-            "SqliteNotificationRepository.OpenAsync",
+            "Worker.ScanAsync",
+            "SqlRepository.OpenAsync",
         )
         assert "chain" in result, result
         names = [step["name"] for step in result["chain"]]
-        assert names[0] == "NotificationWorker.DiscoverAsync"
-        assert names[-1] == "SqliteNotificationRepository.OpenAsync"
+        assert names[0] == "Worker.ScanAsync"
+        assert names[-1] == "SqlRepository.OpenAsync"
 
     def test_get_call_chain_with_primary_constructor_worker(self, tmp_path):
         _, funcs = _project(tmp_path / "cs", WORKER_PRIMARY_CTOR)
         result = funcs["get_call_chain"](
-            "NotificationWorker.DiscoverAsync",
-            "SqliteNotificationRepository.OpenAsync",
+            "Worker.ScanAsync",
+            "SqlRepository.OpenAsync",
         )
         assert "chain" in result, result
 
     def test_get_dependents_finds_callers(self, tmp_path):
         idx, _ = _project(tmp_path / "cs")
-        dependents = idx.reverse_dependency_graph["SqliteNotificationRepository.OpenAsync"]
-        assert "SqliteNotificationRepository.GetMaxSequenceIdAsync" in dependents
+        dependents = idx.reverse_dependency_graph["SqlRepository.OpenAsync"]
+        assert "SqlRepository.GetMaxIdAsync" in dependents
 
 
 class TestAmbiguousInterfaceMethod:
     def test_bare_name_lists_both_candidates(self, tmp_path):
         _, funcs = _project(tmp_path / "cs")
-        info = funcs["find_symbol"]("GetMaxSequenceIdAsync")
+        info = funcs["find_symbol"]("GetMaxIdAsync")
         assert "ambiguous" in info["error"]
         names = {c["name"] for c in info["candidates"]}
         assert names == {
-            "INotificationRepository.GetMaxSequenceIdAsync",
-            "SqliteNotificationRepository.GetMaxSequenceIdAsync",
+            "IRepository.GetMaxIdAsync",
+            "SqlRepository.GetMaxIdAsync",
         }
         assert all(c["file"] for c in info["candidates"])
 
     def test_qualified_name_resolves(self, tmp_path):
         _, funcs = _project(tmp_path / "cs")
-        info = funcs["find_symbol"]("SqliteNotificationRepository.GetMaxSequenceIdAsync")
+        info = funcs["find_symbol"]("SqlRepository.GetMaxIdAsync")
         assert "error" not in info
-        assert info["name"] == "SqliteNotificationRepository.GetMaxSequenceIdAsync"
+        assert info["name"] == "SqlRepository.GetMaxIdAsync"
 
 
 STORE_WITH_OWN_OPEN = """\
-namespace Notifications;
+namespace App;
 
-public sealed class SqliteDeliveryStore
+public sealed class Store
 {
     private async Task<object> OpenAsync()
     {
@@ -237,13 +237,13 @@ public sealed class SqliteDeliveryStore
 """
 
 WORKER_USING_STORE = """\
-namespace Notifications;
+namespace App;
 
-public sealed class NotificationWorker
+public sealed class Worker
 {
-    private readonly SqliteDeliveryStore _store = new SqliteDeliveryStore();
+    private readonly Store _store = new Store();
 
-    public async Task DiscoverAsync()
+    public async Task ScanAsync()
     {
         await _store.CaptureAsync();
     }
@@ -256,23 +256,23 @@ class TestSameNameMethodsOfUnrelatedClasses:
 
     def _two_openers(self, root):
         root.mkdir()
-        _write(root / "SqliteNotificationRepository.cs", REPOSITORY_IMPL)
-        _write(root / "SqliteDeliveryStore.cs", STORE_WITH_OWN_OPEN)
-        _write(root / "NotificationWorker.cs", WORKER_USING_STORE)
+        _write(root / "SqlRepository.cs", REPOSITORY_IMPL)
+        _write(root / "Store.cs", STORE_WITH_OWN_OPEN)
+        _write(root / "Worker.cs", WORKER_USING_STORE)
         idx = ProjectIndexer(str(root)).index()
         return idx, create_project_query_functions(idx)
 
     def test_unqualified_call_resolves_to_the_enclosing_class(self, tmp_path):
         idx, _ = self._two_openers(tmp_path / "cs")
-        deps = idx.global_dependency_graph["SqliteDeliveryStore.CaptureAsync"]
-        assert "SqliteDeliveryStore.OpenAsync" in deps
-        assert "SqliteNotificationRepository.OpenAsync" not in deps
+        deps = idx.global_dependency_graph["Store.CaptureAsync"]
+        assert "Store.OpenAsync" in deps
+        assert "SqlRepository.OpenAsync" not in deps
 
     def test_no_call_chain_through_a_same_name_private_helper(self, tmp_path):
         _, funcs = self._two_openers(tmp_path / "cs")
         result = funcs["get_call_chain"](
-            "NotificationWorker.DiscoverAsync",
-            "SqliteNotificationRepository.OpenAsync",
+            "Worker.ScanAsync",
+            "SqlRepository.OpenAsync",
         )
         assert "chain" not in result, result
         assert "no path" in result["error"]
@@ -280,16 +280,16 @@ class TestSameNameMethodsOfUnrelatedClasses:
     def test_chain_to_the_class_that_really_owns_the_call_is_kept(self, tmp_path):
         _, funcs = self._two_openers(tmp_path / "cs")
         result = funcs["get_call_chain"](
-            "NotificationWorker.DiscoverAsync", "SqliteDeliveryStore.OpenAsync"
+            "Worker.ScanAsync", "Store.OpenAsync"
         )
         names = [step["name"] for step in result["chain"]]
-        assert names[0] == "NotificationWorker.DiscoverAsync"
-        assert names[-1] == "SqliteDeliveryStore.OpenAsync"
+        assert names[0] == "Worker.ScanAsync"
+        assert names[-1] == "Store.OpenAsync"
 
     def test_target_names_do_not_include_sibling_methods(self, tmp_path):
         idx, _ = self._two_openers(tmp_path / "cs")
         engine = ProjectQueryEngine(idx)
-        names = engine._get_graph_target_names("SqliteNotificationRepository.OpenAsync")
-        assert "SqliteNotificationRepository.OpenAsync" in names
-        assert "SqliteNotificationRepository.GetMaxSequenceIdAsync" not in names
+        names = engine._get_graph_target_names("SqlRepository.OpenAsync")
+        assert "SqlRepository.OpenAsync" in names
+        assert "SqlRepository.GetMaxIdAsync" not in names
         assert "OpenAsync" not in names
