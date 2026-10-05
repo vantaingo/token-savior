@@ -28,6 +28,34 @@ in code that does not compile.
 The global rule puts scratch files in `./tmp` and requires it to be gitignored; the repository
 only ignored `*.tmp`. Added `/tmp/` to `.gitignore`.
 
+### 2026-10-05 — Schema fix: enforce aliased required arguments at dispatch, not in the schema
+
+Issue #2 (upstream #120) suggests dropping `required` for aliased arguments and enforcing it after
+`_normalize_arguments()`. Followed as suggested. The enforcement needed no new code:
+`_dispatch_tool` already turns the handler's `KeyError` into an explicit error naming the argument
+(`_message_argument_obligatoire`, which reads the raw `TOOL_SCHEMAS`, not the advertised schema).
+The cost is that the SDK no longer rejects a call with no argument at all: the server answers with
+its own error text instead, a trade accepted because a top-level `anyOf` makes the tool invisible
+to Anthropic clients. A test per affected tool locks the error text.
+
+### 2026-10-05 — Scope added to #2: `ts_search` aliases and the duplicated alias table
+
+Two things found while tracing the fix, included because they sit on the same code path:
+- `ts_search` is routed to `_handle_ts_search` before `_dispatch_tool`, so its aliases
+  (`pattern`, `q`) were never normalized and a missing `query` silently searched for `""`. Since
+  `ts_search` is the tool the fix makes visible again, it now normalizes and reports a missing
+  `query` itself.
+- `_ARG_ALIASES` / `_normalize_arguments` were defined twice in `server.py` (schemas used the
+  first copy, dispatch the second, which alone had `find_symbol(query=...)`). Kept the first
+  copy with the `find_symbol` entry merged in, deleted the second, so schema and dispatch can no
+  longer drift apart.
+
+### 2026-10-05 — The second pull request is stacked on the first
+
+Both fixes append to `docs/decisions.md`, which the first branch creates, and both touch
+`.gitignore`. Branch `fix/2-…` is therefore based on `fix/1-…` to avoid add/add conflicts. Merge
+the first pull request first; the second then shows only its own commits.
+
 ### 2026-10-05 — New tests are written in English
 
 The surrounding tests and comments are in French; the user's rule says every file is written in

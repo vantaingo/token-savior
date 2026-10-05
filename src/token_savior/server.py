@@ -168,7 +168,7 @@ _ARG_ALIASES: dict[str, dict[str, str]] = {
     "get_class_source": {"symbol_name": "name", "class_name": "name"},
     "get_full_context": {"symbol_name": "name", "symbol": "name"},
     "get_edit_context": {"symbol_name": "name", "symbol": "name"},
-    "find_symbol": {"symbol_name": "name", "symbol": "name"},
+    "find_symbol": {"symbol_name": "name", "symbol": "name", "query": "name"},
     "list_files": {"glob": "pattern", "query": "pattern"},
     "read_lines": {"file": "file_path", "path": "file_path", "line": "start",
                    "start_line": "start", "end_line": "end"},
@@ -176,8 +176,12 @@ _ARG_ALIASES: dict[str, dict[str, str]] = {
 }
 
 
-def _normalize_arguments(name: str, arguments: dict) -> dict:
-    """Traduit les alias vers le nom canonique. Le canonique gagne toujours."""
+def _normalize_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Traduit les alias vers le nom canonique. Le canonique gagne toujours.
+
+    Ne remplace jamais une valeur deja fournie sous le bon nom : si l'appelant
+    a mis les deux, le canonique gagne et l'alias est ignore.
+    """
     table = _ARG_ALIASES.get(name)
     if not table or not isinstance(arguments, dict):
         return arguments
@@ -208,15 +212,23 @@ def _with_aliases(name: str, schema: dict) -> dict:
         spec = dict(props[canonical])
         spec["description"] = f"Alias de `{canonical}`. " + str(spec.get("description") or "")
         out["properties"][alias] = spec
+    # An argument that can be passed under another name cannot stay in `required`:
+    # the SDK would reject the alias before the translation runs. The obvious
+    # fix, a root `anyOf` of the alternatives, is worse: the Anthropic API
+    # rejects oneOf/allOf/anyOf at the top of an input_schema, and Claude Code
+    # then drops the tool silently (ts_search, search_codebase, switch_project,
+    # replace_symbol_source were all invisible). So the root stays a plain
+    # object, and the requirement is enforced at dispatch, after
+    # _normalize_arguments: see _message_argument_obligatoire.
     required = schema.get("required")
     if isinstance(required, list) and required:
-        alt = [list(required)]
-        for alias, canonical in table.items():
-            if canonical in required and alias in out["properties"]:
-                alt.append([alias if r == canonical else r for r in required])
-        if len(alt) > 1:
-            out.pop("required", None)
-            out["anyOf"] = [{"required": a} for a in alt]
+        aliased = {canonical for alias, canonical in table.items() if alias in out["properties"]}
+        kept = [r for r in required if r not in aliased]
+        if len(kept) != len(required):
+            if kept:
+                out["required"] = kept
+            else:
+                out.pop("required", None)
     return out
 
 
@@ -927,51 +939,6 @@ def _prefetch_next(name: str, record_symbol: str, slot) -> None:
         pass
 
 
-# Le meme concept portait trois noms selon l'outil, et l'appelant devinait.
-# Mesure sur 295 appels reels : 9 utilisaient un nom d'argument inexistant, et
-# chacun etait le nom employe par un outil VOISIN pour la meme chose --
-# `query` vient de ts_search, `source` de replace_symbol_source. Ce ne sont pas
-# des fautes d'appelant, c'est une API incoherente, et chaque devinette ratee
-# coute un aller-retour complet.
-#
-# On accepte donc l'alias plutot que de refuser. Le schema continue d'annoncer
-# le nom canonique : les alias rattrapent, ils ne remplacent pas.
-_ARG_ALIASES: dict[str, dict[str, str]] = {
-    "search_codebase": {"query": "pattern", "q": "pattern", "regex": "pattern"},
-    "insert_near_symbol": {"source": "content", "new_source": "content",
-                           "code": "content", "name": "symbol_name"},
-    "replace_symbol_source": {"content": "new_source", "source": "new_source",
-                              "code": "new_source", "name": "symbol_name"},
-    "switch_project": {"project": "name", "path": "name", "root": "name"},
-    "set_project_root": {"project": "path", "name": "path", "root": "path"},
-    "get_function_source": {"symbol_name": "name", "function": "name"},
-    "get_class_source": {"symbol_name": "name", "class_name": "name"},
-    "get_full_context": {"symbol_name": "name", "symbol": "name"},
-    "get_edit_context": {"symbol_name": "name", "symbol": "name"},
-    "find_symbol": {"symbol_name": "name", "symbol": "name", "query": "name"},
-    "list_files": {"glob": "pattern", "query": "pattern"},
-    "read_lines": {"file": "file_path", "path": "file_path", "line": "start",
-                   "start_line": "start", "end_line": "end"},
-    "ts_search": {"pattern": "query", "q": "query"},
-}
-
-
-def _normalize_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    """Traduit les alias connus vers le nom canonique de l'outil.
-
-    Ne remplace jamais une valeur deja fournie sous le bon nom : si l'appelant
-    a mis les deux, le canonique gagne et l'alias est ignore.
-    """
-    table = _ARG_ALIASES.get(name)
-    if not table or not isinstance(arguments, dict):
-        return arguments
-    out = dict(arguments)
-    for alias, canonique in table.items():
-        if alias in out and canonique not in out:
-            out[canonique] = out.pop(alias)
-    return out
-
-
 def _locate_across_projects(file_hint: str) -> str:
     """Cherche un fichier dans les AUTRES projets enregistres.
 
@@ -1179,6 +1146,15 @@ def _handle_ts_search(arguments: dict[str, Any]) -> list[types.TextContent]:
     excluded (e.g. capture_* under TS_CAPTURE_DISABLED=1).
     """
     import json as _json
+
+    # ts_search is routed here before _dispatch_tool, which is where aliases are
+    # normalized, so `ts_search(pattern=...)` used to search for an empty query.
+    arguments = _normalize_arguments("ts_search", arguments)
+    if not arguments.get("query"):
+        return [TextContent(type="text", text=(
+            "Error: ts_search requires 'query'.\n"
+            '  Example: ts_search(query="search the codebase with a regex")'
+        ))]
 
     # Cold-start bridge (opt-in via TS_SEARCH_COLD_DELEGATE=1): the in-process
     # model load costs ~5s on a fresh stdio spawn (audit 2026-07-04: ts_search

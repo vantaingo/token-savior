@@ -20,7 +20,7 @@ import os
 
 import pytest
 
-from token_savior.server import _normalize_arguments
+from token_savior.server import _normalize_arguments, _with_aliases
 from token_savior.slot_manager import SlotManager
 
 # --- Alias d'arguments ----------------------------------------------------- #
@@ -61,6 +61,80 @@ def test_ne_mute_pas_l_appelant() -> None:
 @pytest.mark.parametrize("args", [None, "pas un dict", 42])
 def test_tolere_une_entree_malformee(args) -> None:
     assert _normalize_arguments("search_codebase", args) == args
+
+
+def test_find_symbol_accepte_query() -> None:
+    assert _normalize_arguments("find_symbol", {"query": "f"}) == {"name": "f"}
+
+
+# --- Aliases declared in the advertised schema ------------------------------ #
+
+def _schema(required, *props):
+    return {"type": "object", "properties": {p: {"type": "string"} for p in props},
+            "required": list(required)}
+
+
+def test_with_aliases_declares_aliases_without_a_toplevel_combinator() -> None:
+    out = _with_aliases("search_codebase", _schema(["pattern"], "pattern", "max_results"))
+    assert {"query", "q", "regex"} <= set(out["properties"])
+    assert not {"anyOf", "oneOf", "allOf"} & set(out)
+
+
+def test_with_aliases_drops_only_the_aliased_arguments_from_required() -> None:
+    out = _with_aliases("replace_symbol_source",
+                        _schema(["symbol_name", "new_source", "other"],
+                                "symbol_name", "new_source", "other"))
+    assert out["required"] == ["other"]
+
+
+def test_with_aliases_drops_required_when_nothing_else_is_required() -> None:
+    out = _with_aliases("search_codebase", _schema(["pattern"], "pattern"))
+    assert "required" not in out
+
+
+def test_with_aliases_leaves_a_tool_without_aliases_untouched() -> None:
+    schema = _schema(["x"], "x")
+    assert _with_aliases("get_git_status", schema) == schema
+
+
+def test_with_aliases_does_not_mutate_its_input() -> None:
+    schema = _schema(["pattern"], "pattern")
+    before = {"properties": dict(schema["properties"]), "required": list(schema["required"])}
+    _with_aliases("search_codebase", schema)
+    assert schema["properties"] == before["properties"]
+    assert schema["required"] == before["required"]
+
+
+def test_every_advertised_schema_is_free_of_toplevel_combinators() -> None:
+    from token_savior.server import TOOLS
+    bad = [t.name for t in TOOLS if {"anyOf", "oneOf", "allOf"} & set(t.inputSchema)]
+    assert bad == []
+
+
+# --- ts_search is routed before _dispatch_tool ------------------------------ #
+
+def test_ts_search_normalizes_its_aliases(monkeypatch) -> None:
+    import token_savior.server as srv
+    seen = {}
+
+    def fake(query, **kwargs):
+        seen["query"] = query
+        return {"tools": []}
+
+    monkeypatch.setattr(srv, "_ts_search_impl", fake)
+    monkeypatch.setattr(srv.s, "_TS_SEARCH_COLD_DELEGATE", False)
+    srv._handle_ts_search({"pattern": "find things"})
+    assert seen["query"] == "find things"
+
+
+def test_ts_search_without_query_names_the_missing_argument(monkeypatch) -> None:
+    import token_savior.server as srv
+    monkeypatch.setattr(srv, "_ts_search_impl",
+                        lambda *a, **k: pytest.fail("must not search for an empty query"))
+    monkeypatch.setattr(srv.s, "_TS_SEARCH_COLD_DELEGATE", False)
+    out = srv._handle_ts_search({})
+    assert "query" in out[0].text
+    assert out[0].text.startswith("Error")
 
 
 # --- Resolution de projet -------------------------------------------------- #

@@ -123,11 +123,47 @@ def test_le_schema_annonce_les_alias(serveur) -> None:
     """Un alias accepte mais non declare reste invisible pour l'appelant."""
     schema = serveur.outils()["search_codebase"]["inputSchema"]
     assert "query" in schema.get("properties", {})
-    # et le `required` doit accepter l'un OU l'autre
-    if "required" in schema:
-        assert "pattern" not in schema["required"] or "anyOf" in schema
-    else:
-        assert "anyOf" in schema
+    # An aliased argument cannot stay in `required`, or the alias would be rejected;
+    # the requirement is enforced at dispatch instead (see the tests below).
+    assert "pattern" not in schema.get("required", [])
+
+
+def test_aucun_schema_n_a_de_combinateur_a_la_racine(serveur) -> None:
+    """The Anthropic API rejects oneOf/allOf/anyOf at the top of an input_schema
+    (`input_schema does not support oneOf, allOf, or anyOf at the top level`).
+    Claude Code then leaves the tool out silently: ts_search, search_codebase,
+    switch_project and replace_symbol_source disappeared that way."""
+    fautifs = {
+        nom: [k for k in ("anyOf", "oneOf", "allOf") if k in t["inputSchema"]]
+        for nom, t in serveur.outils().items()
+    }
+    assert {n: k for n, k in fautifs.items() if k} == {}
+    for nom, t in serveur.outils().items():
+        assert t["inputSchema"].get("type") == "object", nom
+
+
+@pytest.mark.parametrize("outil,manquant", [
+    ("search_codebase", "pattern"),
+    ("switch_project", "name"),
+    ("replace_symbol_source", "symbol_name"),
+    ("insert_near_symbol", "symbol_name"),
+    ("set_project_root", "path"),
+    ("get_edit_context", "name"),
+    ("ts_search", "query"),
+])
+def test_un_argument_alias_absent_est_nomme_dans_l_erreur(serveur, outil, manquant) -> None:
+    """Dropping the aliased argument from `required` must not turn a missing
+    argument into a raw KeyError or a silent empty result."""
+    reponse = serveur.appel(outil, {})
+    assert manquant in reponse, f"{outil}({{}}) -> {reponse[:200]}"
+    assert "KeyError" not in reponse
+
+
+def test_ts_search_accepte_son_alias(serveur) -> None:
+    """ts_search is routed before _dispatch_tool, so its aliases were never
+    normalized: ts_search(pattern=...) searched for an empty query."""
+    reponse = serveur.appel("ts_search", {"pattern": "search the codebase with a regex"})
+    assert "search_codebase" in reponse, reponse[:200]
 
 
 def test_le_canonique_gagne_si_les_deux_sont_fournis(serveur) -> None:
