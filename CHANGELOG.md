@@ -73,6 +73,26 @@ spawn cwd carries its signal.
 - Hooks and the standalone CLI now fall back `CLAUDE_PROJECT_ROOT` →
   `CLAUDE_PROJECT_DIR` → `$PWD`; the session-start memory hook previously
   read only the first, which no host sets, and ran with an empty project.
+- **Tool schemas no longer carry a top-level `anyOf`.** `_with_aliases()` turned
+  the `required` of every tool with argument aliases into a root
+  `anyOf: [{required: [canonical]}, {required: [alias]}]`. The Anthropic API
+  rejects `oneOf` / `allOf` / `anyOf` at the top of an `input_schema`, and
+  Claude Code answers by leaving the tool out, without any error: with the
+  `optimized` profile `ts_search`, `search_codebase`, `switch_project` and
+  `replace_symbol_source` were invisible (7 tools in `full`, adding
+  `get_edit_context`, `insert_near_symbol`, `set_project_root`). Since
+  `ts_search` carries the deferred discovery of hidden tools, `optimized`,
+  `tiny`, `code_mode` and `auto` all lost it. This reverses the `anyOf` design
+  of the alias entry below: aliased arguments now leave `required`, the alias
+  properties stay declared (so the SDK still accepts them), and the missing
+  argument is reported at dispatch, after normalization, by the existing
+  explicit error naming the canonical argument.
+- **`ts_search` honours its aliases.** It is routed before `_dispatch_tool`,
+  where aliases are normalized, so `ts_search(pattern=...)` searched for an
+  empty query; a missing `query` is now an explicit error too.
+- `_ARG_ALIASES` and `_normalize_arguments` were defined twice in `server.py`;
+  schemas were built from the first copy and dispatch used the second, which
+  alone knew `find_symbol(query=...)`. One copy remains.
 
 ## v4.21.0 — The server stops keeping what it knows to itself (2026-07-28)
 
