@@ -133,3 +133,27 @@ comment texts were rewritten the same way and the user deletes the old revisions
 Rule from now on: anything posted to a public repository is anonymized before posting. The user
 chose not to rewrite `main` history: the earlier commits and the PR #8 / #10 diffs keep the old
 names (a force-push would not purge `refs/pull`, only GitHub support can).
+
+### 2026-10-19 — Upstream sync (v4.24.0): cache version 5, fork entries in their own CHANGELOG section
+
+Issue #15 merged `Mibayy/token-savior` `main` (v4.24.0) into the fork with a merge commit, not a
+rebase, so the fork's merged pull requests keep their commits. Both sides had bumped
+`_CACHE_VERSION` from 3 to 4 for unrelated reasons (fork: the C# annotator fills
+`dependency_graph`; upstream: `.mjs`/`.cjs` indexed and TS/JS module bindings as variables). The
+merge sets it to 5. Why: keeping 4 would let a cache built by either side alone pass as valid while
+missing the other side's change; 5 forces one rebuild everywhere.
+The clean auto-merge of `CHANGELOG.md` left the fork's entries inside upstream's v4.22.0 section,
+which would credit fork fixes to an upstream release. They now sit in a top
+`## Unreleased — Fork fixes` section, unchanged except for the cache version note.
+Approved by the user before execution (plan posted on issue #15).
+
+### 2026-10-19 14:00 — Upstream sync: two upstream schema tests aligned with fork fix #2
+
+Two tests added upstream in v4.22.0 (`test_le_schema_de_ts_execute_accepte_code`,
+`test_ts_execute_in_tool_manifest`) expect the `ts_execute` schema to require `script` through a
+top-level `anyOf`. Fork fix #2 removed that `anyOf` on purpose (the Anthropic API rejects it and
+Claude Code then hides the tool); upstream never had that fix, so its tests agree with its own code.
+The tests now check the fork's behaviour: the aliases are declared, `script` is not in `required`,
+and there is no top-level `anyOf`. The missing argument stays enforced at dispatch
+(`test_un_argument_alias_absent_est_nomme_dans_l_erreur`, 7 cases, passing). The code is unchanged.
+Approved by the user as a plan change (comment on issue #15).

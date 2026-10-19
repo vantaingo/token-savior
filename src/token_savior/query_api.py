@@ -10,7 +10,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Callable
 from functools import partial
 
@@ -23,6 +23,7 @@ from token_savior.models import (
     StructuralMetadata,
     variables_mode,
 )
+from token_savior.project_indexer import _rebuild_path_indexes
 from token_savior.symbol_hash import analyze_symbol_semantics
 
 # Canonical order for the `kinds` parameter and for the `searched` /
@@ -39,6 +40,12 @@ _SYMBOL_KINDS = ("function", "class", "variable")
 # autre projet que celui vise : on le signale au lieu de conclure a une absence.
 _INDEX_SUSPECT = 25
 _MAX_HOMONYMES = 5
+# Nombre de noms distincts au-dela duquel `_fichiers_definissant` bascule du
+# scan memoise vers l'index complet. Mesure du 12/08/2026 sur 19 160 fichiers :
+# construire l'index coute 2,7 scans, donc a partir du 3e nom demande il est
+# deja amorti. En dessous, il ferait payer a `find_symbol` un balayage entier
+# pour un seul nom.
+_SEUIL_INDEX_DEFINISSEURS = 3
 
 def _split_signature_suffix(name: str) -> tuple[str, str]:
     if name.endswith(")") and "(" in name:
@@ -494,6 +501,30 @@ def format_signature(func, path: str = "") -> str:
     return f"{prefixe}{func.name}({params})"
 
 
+def _symboles_par_portee(meta) -> list[tuple[int, int, str]]:
+    """(début, fin, nom qualifié) des fonctions et classes d'un fichier, les
+    plus courtes d'abord : la première qui contient une ligne est la plus
+    précise."""
+    out: list[tuple[int, int, str]] = []
+    for f in getattr(meta, "functions", None) or []:
+        lr = getattr(f, "line_range", None)
+        if lr:
+            out.append((lr.start, lr.end, f.qualified_name or f.name))
+    for c in getattr(meta, "classes", None) or []:
+        lr = getattr(c, "line_range", None)
+        if lr:
+            out.append((lr.start, lr.end, c.name))
+    out.sort(key=lambda t: t[1] - t[0])
+    return out
+
+
+def _symbole_englobant(portees: list[tuple[int, int, str]], ligne: int) -> str | None:
+    for debut, fin, nom in portees:
+        if debut <= ligne <= fin:
+            return nom
+    return None
+
+
 def _format_l2(sym: FunctionInfo | ClassInfo, body: str) -> str:
     """Semantic summary: raises, side effects, return hints, first doc line."""
     if isinstance(sym, ClassInfo):
@@ -803,6 +834,7 @@ class ProjectQueryEngine:
         "get_imports",
         "get_function_source",
         "get_class_source",
+        "get_variable_source",
         "find_symbol",
         "get_dependencies",
         "get_dependents",
@@ -831,8 +863,30 @@ class ProjectQueryEngine:
     def __init__(self, index: ProjectIndex):
         self.index = index
         self._communities: dict[str, str] | None = None
+        self._communities_version: int | None = None
         self._semantic_hash_cache: dict[str, str] | None = None
         self._semantic_hash_seuil: int | None = None
+        self._semantic_hash_version: int | None = None
+        # Deux caches pour `_fichiers_definissant`, reutilises pour toute la
+        # vie de l'instance (le slot_manager garde un engine par projet et le
+        # reutilise pour tous les appels suivants) :
+        #  - `_memo`, nom -> fichiers, rempli un nom a la fois par un scan
+        #    court-circuite : c'est le regime des requetes qui ne demandent
+        #    qu'un ou deux noms, `find_symbol` en tete ;
+        #  - `_index`, nom -> fichiers pour TOUT le projet, construit d'un bloc
+        #    seulement quand assez de noms distincts ont ete demandes pour
+        #    l'amortir (`_SEUIL_INDEX_DEFINISSEURS`), puis jamais mute.
+        # `_version` porte le `files_version` sur lequel les deux ont ete
+        # construits ; une edition le fait avancer et les perime.
+        self._fichiers_definissant_index: dict[str, list[str]] | None = None
+        self._fichiers_definissant_memo: dict[str, list[str]] = {}
+        self._fichiers_definissant_version: int | None = None
+        # Meme mecanique, meme invalidation, pour `_classes_definissant` : le
+        # signalement d'ambiguite de classe dans `_resolve_symbol_info` faisait
+        # son propre balayage complet des fichiers a CHAQUE appel, sans cache.
+        self._classes_homonymes_index: dict[str, list[str]] | None = None
+        self._classes_homonymes_memo: dict[str, list[str]] = {}
+        self._classes_homonymes_version: int | None = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -847,7 +901,7 @@ class ProjectQueryEngine:
     # ------------------------------------------------------------------
 
     def get_project_summary(self) -> str:
-        """Compact project overview: counts + top packages only."""
+        """Compact project overview: counts, top packages, hubs and subsystems."""
         index = self.index
         parts = [
             f"Project: {index.root_path}",
@@ -912,7 +966,48 @@ class ProjectQueryEngine:
         if func_count:
             parts.append(f"Top-level functions: {func_count} total")
 
+        parts.extend(self._architecture_lines())
         return "\n".join(parts)
+
+    def _architecture_lines(self, n_hubs: int = 6, n_subsystems: int = 5) -> list[str]:
+        """Carte d'architecture en deux lignes : les symboles dont tout dépend, et les sous-systèmes.
+
+        Reprise de graphify (« god nodes », communautés), mais tirée du graphe que
+        l'index tient déjà : aucun appel au modèle, et deux lignes au lieu d'un
+        rapport, pour qu'un agent sache où regarder avant d'explorer.
+        """
+        index = self.index
+        rdg = index.reverse_dependency_graph or {}
+        if not rdg:
+            return []
+        lines: list[str] = []
+        hubs = sorted(rdg.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:n_hubs]
+        hubs = [(name, len(users)) for name, users in hubs if len(users) >= 3]
+        if hubs:
+            lines.append("Hubs (most depended-on): " + ", ".join(f"{name} ({n})" for name, n in hubs))
+        try:
+            communities = self._get_communities()
+        except Exception:
+            communities = {}
+        if communities:
+            groups: dict[str, list[str]] = defaultdict(list)
+            for sym, cid in communities.items():
+                groups[cid].append(sym)
+            table = index.symbol_table or {}
+            items = []
+            for cid, members in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:n_subsystems]:
+                if len(members) < 5:
+                    continue
+                chemins = [table[m] for m in members if m in table]
+                # Les tests suivent le code qu'ils testent : on nomme le sous-système
+                # par son code de production quand il en a.
+                prod = [c for c in chemins if "test" not in c.lower()] or chemins
+                dirs = Counter(c.rsplit("/", 1)[0] if "/" in c else "." for c in prod)
+                where = f" in {dirs.most_common(1)[0][0]}/" if dirs else ""
+                items.append(f"{cid} ({len(members)}{where})")
+            if items:
+                lines.append("Subsystems (graph communities, named by their hub): " + "; ".join(items))
+        return lines
 
     def list_files(self, pattern: str | None = None, max_results: int = 0) -> list[str]:
         """List indexed files, optional glob filter (using fnmatch)."""
@@ -1349,6 +1444,19 @@ class ProjectQueryEngine:
             variable_result = self._resolve_variable_info(name, level=level)
             if variable_result is not None:
                 result = variable_result
+        # Repli sur les variables quand l'appelant n'a pas choisi de genres.
+        # Releve du 06/10/2026 sur 30 jours : les « not found » de
+        # find_symbol et get_edit_context portaient surtout sur des constantes
+        # de module (POSTES_ESTALLE_MP, SENDER, REGISTRATION_ERRORS). Le
+        # rapport `retry_with` coutait un aller-retour pour une reponse que
+        # l'index avait deja. Une fonction ou une classe du meme nom garde la
+        # priorite : le repli ne joue que sur un echec.
+        if ("file" not in result and "error" not in result and kinds is None
+                and "variable" not in searched
+                and "variable" in self._indexed_kinds()):
+            variable_result = self._resolve_variable_info(name, level=level)
+            if variable_result is not None:
+                result = {**variable_result, "trouve_par": "repli sur les variables"}
 
         if "file" not in result:
             if "error" in result:  # ambiguous / normalized-candidates report
@@ -1449,6 +1557,37 @@ class ProjectQueryEngine:
             out["source_preview"] = meta.lines[var.line_number - 1]
         return out
 
+    def get_variable_source(self, name: str, max_lines: int = 200) -> str:
+        """Source of a module or class binding: from its line to the end of
+        the value, brackets balanced.
+
+        `get_full_context` and `get_edit_context` only knew functions and
+        classes, so a constant came back as "function 'X' not found" even
+        after find_symbol had located it. Releve du 06/10/2026 : c'etait la
+        moitie des echecs de get_edit_context sur 30 jours
+        (POSTES_ESTALLE_MP, SENDER, readToken...).
+        """
+        info = self._resolve_variable_info(name, level=2)
+        if not info or "file" not in info:
+            return f"Error: variable '{name}' not found in project"
+        meta = _resolve_file(self.index, info["file"])
+        if meta is None:
+            return f"Error: file '{info['file']}' not found in index"
+        lignes = meta.lines
+        debut = info["line"]
+        fin = debut
+        profondeur = 0
+        borne = min(len(lignes), debut - 1 + max(1, max_lines))
+        for i in range(debut - 1, borne):
+            texte = lignes[i]
+            profondeur += sum(texte.count(c) for c in "([{")
+            profondeur -= sum(texte.count(c) for c in ")]}")
+            fin = i + 1
+            if profondeur <= 0 and not texte.rstrip().endswith(("\\", ",", "=", "+", "(", "[", "{")):
+                break
+        corps = "\n".join(lignes[debut - 1:fin])
+        return f"{info['type']} {info['name']} ({info['file']}:{debut}-{fin})\n{corps}"
+
     def get_dependencies(
         self, name: str, max_results: int = 0, depth: int = 1
     ) -> list[dict]:
@@ -1516,15 +1655,165 @@ class ProjectQueryEngine:
         `symbol_table` n'en garde qu'un : sur un projet Next.js ou trente
         fichiers exportent `POST`, il en designe un seul, et les resolveurs qui
         s'y fient rendent un fichier au hasard de l'ordre alphabetique.
+
+        Deux regimes, parce que les deux appelants n'ont pas le meme profil.
+        `get_dependents` demande beaucoup de noms differents (deux appels par
+        dependance) : sans index, le scan lineaire se payait par nom, soit
+        O(dependances x fichiers) par requete (p95 mesuree a 3805 ms).
+        `find_symbol`, lui, n'en demande qu'UN, et le plus souvent sur une
+        instance fraiche (un message = un processus = un engine neuf). Lui
+        faire construire l'index complet du projet des le premier appel
+        revenait a lui faire payer 2,7 scans la ou un seul suffisait (mesure
+        du 12/08/2026 sur 19 160 fichiers / 198 520 symboles : 201 ms de
+        construction contre 75 ms de scan), d'ou une p95 passee de 382 ms a
+        3566 ms.
+
+        Donc : scan court-circuite et memoise tant qu'on reste sous
+        `_SEUIL_INDEX_DEFINISSEURS` noms distincts, index complet ensuite. Le
+        seuil est place la ou la construction est deja amortie par les scans
+        qu'elle evite. Meme resultat et meme ordre (alphabetique) dans les
+        deux regimes.
+
+        Les deux caches sont versionnes contre `index.files_version` : ils
+        tombent des qu'une edition a modifie le jeu de fichiers
+        (replace_symbol_source / insert_near_symbol / move_symbol passent
+        toutes par `indexer.reindex_file`), sans quoi l'engine garderait en
+        session une vue perimee des definisseurs.
         """
-        out: list[str] = []
-        for chemin, meta in sorted(self.index.files.items()):
-            fns = getattr(meta, "functions", None) or []
-            cls = getattr(meta, "classes", None) or []
-            if any(getattr(f, "name", None) == nom or getattr(f, "qualified_name", None) == nom for f in fns) \
-               or any(getattr(c, "name", None) == nom or getattr(c, "qualified_name", None) == nom for c in cls):
-                out.append(chemin)
-        return out
+        if self._fichiers_definissant_version != self.index.files_version:
+            self._fichiers_definissant_index = None
+            self._fichiers_definissant_memo = {}
+            self._fichiers_definissant_version = self.index.files_version
+
+        if self._fichiers_definissant_index is not None:
+            return self._fichiers_definissant_index.get(nom, [])
+
+        memo = self._fichiers_definissant_memo
+        if nom in memo:
+            return memo[nom]
+
+        # `sorted_paths` est deja `sorted(files.keys())`, maintenu par
+        # `_rebuild_path_indexes` : le retrier ici serait le payer deux fois.
+        # Le `or sorted(self.index.files)` d'avant le repayait quand meme a
+        # CHAQUE appel du regime scan : une liste vide est falsy, donc un index
+        # arrive sans passer par `_rebuild_path_indexes` (cache, deserialisation)
+        # retriait ses 19 160 chemins par appel. On repare l'index une fois, sur
+        # l'objet partage, donc aussi pour tous les autres lecteurs de
+        # `sorted_paths`. Un projet reellement sans fichier garde `[]`.
+        if not self.index.sorted_paths and self.index.files:
+            _rebuild_path_indexes(self.index)
+        chemins = self.index.sorted_paths
+
+        if len(memo) < _SEUIL_INDEX_DEFINISSEURS:
+            trouve: list[str] = []
+            for chemin in chemins:
+                meta = self.index.files.get(chemin)
+                fns = getattr(meta, "functions", None) or []
+                cls = getattr(meta, "classes", None) or []
+                if any(getattr(f, "name", None) == nom
+                       or getattr(f, "qualified_name", None) == nom for f in fns) \
+                   or any(getattr(c, "name", None) == nom
+                          or getattr(c, "qualified_name", None) == nom for c in cls):
+                    trouve.append(chemin)
+            memo[nom] = trouve
+            return trouve
+
+        # Assez de noms distincts demandes pour que l'index complet soit
+        # rentable. Construit d'un bloc, jamais mute ensuite.
+        index: dict[str, list[str]] = {}
+        for chemin in chemins:
+            meta = self.index.files.get(chemin)
+            # Un fichier n'apparait qu'une fois par nom, meme s'il porte
+            # plusieurs symboles homonymes (ou si `qualified_name` egale
+            # `name`) : le scan par appel appendait aussi un seul chemin.
+            noms_du_fichier: set[str] = set()
+            for symbole in list(getattr(meta, "functions", None) or []) \
+                    + list(getattr(meta, "classes", None) or []):
+                for attr in ("name", "qualified_name"):
+                    valeur = getattr(symbole, attr, None)
+                    if valeur:
+                        noms_du_fichier.add(valeur)
+            for nom_defini in noms_du_fichier:
+                index.setdefault(nom_defini, []).append(chemin)
+        self._fichiers_definissant_index = index
+        memo.clear()
+        return index.get(nom, [])
+
+    def _classes_definissant(self, nom: str) -> list[str]:
+        """Tous les fichiers qui definissent une CLASSE de ce nom.
+
+        Jumeau de `_fichiers_definissant`, restreint aux classes, parce que
+        `_resolve_symbol_info` a besoin de compter les definitions de classe
+        pour savoir s'il rend une reponse sur N presentee comme la seule.
+
+        Ce comptage se faisait en clair, sans cache, par un
+        `sorted(index.files.items())` suivi d'un balayage de toutes les classes
+        de tous les fichiers -- a CHAQUE appel de `_resolve_symbol_info`, donc a
+        chaque `find_symbol`, et une fois par dependance dans `get_dependents`,
+        `get_dependencies` et `get_call_chain`. Le cache pose sur
+        `_fichiers_definissant` ne l'atteignait pas : c'est ce balayage-la qui
+        restait a payer, et la p95 de `find_symbol` avec (437 ms -> 3343 ms).
+
+        Meme sortie et meme ordre (alphabetique) qu'avant, pour ne rien changer
+        au service rendu : l'ambiguite entre classes homonymes reste signalee.
+        Meme invalidation que le jumeau, contre `index.files_version`, sans quoi
+        un `replace_symbol_source` / `move_symbol` qui renomme une classe
+        laisserait la vue des definisseurs perimee pour la session.
+        """
+        if self._classes_homonymes_version != self.index.files_version:
+            self._classes_homonymes_index = None
+            self._classes_homonymes_memo = {}
+            self._classes_homonymes_version = self.index.files_version
+
+        if self._classes_homonymes_index is not None:
+            return self._classes_homonymes_index.get(nom, [])
+
+        memo = self._classes_homonymes_memo
+        if nom in memo:
+            return memo[nom]
+
+        # `sorted_paths` est deja `sorted(files.keys())`, maintenu par
+        # `_rebuild_path_indexes` : le retrier ici serait le payer deux fois.
+        # Le `or sorted(self.index.files)` d'avant le repayait quand meme a
+        # CHAQUE appel du regime scan : une liste vide est falsy, donc un index
+        # arrive sans passer par `_rebuild_path_indexes` (cache, deserialisation)
+        # retriait ses 19 160 chemins par appel. On repare l'index une fois, sur
+        # l'objet partage, donc aussi pour tous les autres lecteurs de
+        # `sorted_paths`. Un projet reellement sans fichier garde `[]`.
+        if not self.index.sorted_paths and self.index.files:
+            _rebuild_path_indexes(self.index)
+        chemins = self.index.sorted_paths
+
+        if len(memo) < _SEUIL_INDEX_DEFINISSEURS:
+            trouve: list[str] = []
+            for chemin in chemins:
+                meta = self.index.files.get(chemin)
+                cls = getattr(meta, "classes", None) or []
+                if any(getattr(c, "name", None) == nom
+                       or getattr(c, "qualified_name", None) == nom for c in cls):
+                    trouve.append(chemin)
+            memo[nom] = trouve
+            return trouve
+
+        # Assez de noms distincts demandes pour que l'index complet soit
+        # rentable. Construit d'un bloc, jamais mute ensuite.
+        index: dict[str, list[str]] = {}
+        for chemin in chemins:
+            meta = self.index.files.get(chemin)
+            # Un fichier n'apparait qu'une fois par nom, meme s'il porte
+            # plusieurs classes homonymes (ou si `qualified_name` egale
+            # `name`) : le scan par appel n'appendait aussi qu'un chemin.
+            noms_du_fichier: set[str] = set()
+            for symbole in (getattr(meta, "classes", None) or []):
+                for attr in ("name", "qualified_name"):
+                    valeur = getattr(symbole, attr, None)
+                    if valeur:
+                        noms_du_fichier.add(valeur)
+            for nom_defini in noms_du_fichier:
+                index.setdefault(nom_defini, []).append(chemin)
+        self._classes_homonymes_index = index
+        memo.clear()
+        return index.get(nom, [])
 
     def _importe(self, chemin: str, cible: str) -> bool:
         """Ce fichier importe-t-il `cible` ?"""
@@ -1872,9 +2161,20 @@ class ProjectQueryEngine:
         def _scan(path: str) -> list[dict]:
             meta = files[path]
             hits: list[dict] = []
+            englobants = None
             for i, line in enumerate(meta.lines):
                 if regex.search(line):
-                    hits.append({"file": path, "line_number": i + 1, "content": _trim(line)})
+                    hit = {"file": path, "line_number": i + 1, "content": _trim(line)}
+                    # Le symbole qui contient la ligne : ce que Grep ne dit pas, et
+                    # la réponse même à « qui appelle X ». Au banc du 07/10/2026,
+                    # « quelle fonction appelle _cible_journalisable » coûtait un
+                    # Grep puis un Read ; ce nom la donne en un appel.
+                    if englobants is None:
+                        englobants = _symboles_par_portee(meta)
+                    nom = _symbole_englobant(englobants, i + 1)
+                    if nom:
+                        hit["in"] = nom
+                    hits.append(hit)
                     if limit and len(hits) >= limit:
                         break
             return hits
@@ -2102,6 +2402,8 @@ class ProjectQueryEngine:
         try:
             if sym_type == "class":
                 result["source"] = self.get_class_source(name, max_lines=max_lines)
+            elif sym_type in ("variable", "constant"):
+                result["source"] = self.get_variable_source(name, max_lines=max_lines)
             else:
                 result["source"] = self.get_function_source(name, max_lines=max_lines)
         except Exception as exc:  # pragma: no cover
@@ -2620,8 +2922,14 @@ class ProjectQueryEngine:
         # Le cache etait construit une seule fois, avec le min_lines du
         # PREMIER appel, puis reutilise tel quel. Un appel ulterieur avec un
         # autre seuil recevait donc un resultat calcule pour l'ancien, sans
-        # rien qui le signale. On le cle par seuil.
-        if self._semantic_hash_cache is None or self._semantic_hash_seuil != min_lines:
+        # rien qui le signale. On le cle par seuil, et par `files_version` :
+        # sinon une edition reindexee laisse le cache fige sur les sources
+        # d'avant, pour toute la vie de l'engine.
+        if (
+            self._semantic_hash_cache is None
+            or self._semantic_hash_seuil != min_lines
+            or self._semantic_hash_version != self.index.files_version
+        ):
             self._build_semantic_hash_cache(min_lines)
 
         cache = self._semantic_hash_cache
@@ -2905,6 +3213,7 @@ class ProjectQueryEngine:
                 key = f"{func.qualified_name}  ({file_path}:{start})"
                 cache[key] = h
         self._semantic_hash_cache = cache
+        self._semantic_hash_version = self.index.files_version
 
     # ------------------------------------------------------------------
     # RWR relevance ranking
@@ -3306,9 +3615,7 @@ class ProjectQueryEngine:
         want_classes = kinds is None or "class" in kinds
         homonymes: list[str] = []
         if want_classes:
-            homonymes = [pth for pth, m in sorted(index.files.items())
-                         if any(c.name == name or c.qualified_name == name
-                                for c in m.classes)]
+            homonymes = self._classes_definissant(name)
             if len(homonymes) <= 1:
                 class_info = self._resolve_exact_class_info(name, level=level)
                 if class_info is not None:
@@ -3371,8 +3678,9 @@ class ProjectQueryEngine:
             return {
                 "name": name,
                 "error": (f"class '{name}' is ambiguous; defined in "
-                          f"{len(fichiers)} files: {', '.join(fichiers[:5])}"),
-                "candidates": fichiers[:10],
+                          f"{len(fichiers)} files: "
+                          f"{', '.join(fichiers[:_MAX_HOMONYMES])}"),
+                "candidates": fichiers[:_MAX_HOMONYMES],
                 "_suggestion": (f"get_class_source('{name}', file_path='{fichiers[0]}') "
                                 "or pass the fully qualified name."),
             }
@@ -3404,9 +3712,10 @@ class ProjectQueryEngine:
                     "name": name,
                     "error": (
                         f"no exact match; normalized-name candidates "
-                        f"({len(candidates)}): {', '.join(candidates[:5])}"
+                        f"({len(candidates)}): "
+                        f"{', '.join(candidates[:_MAX_HOMONYMES])}"
                     ),
-                    "normalized_candidates": candidates[:10],
+                    "normalized_candidates": candidates[:_MAX_HOMONYMES],
                 }
         return {"name": name}
 
@@ -3446,8 +3755,14 @@ class ProjectQueryEngine:
         return None
 
     def _get_communities(self) -> dict[str, str]:
-        if self._communities is None:
+        # Versionne contre `index.files_version`, comme `_fichiers_definissant` :
+        # une edition qui ajoute ou deplace un appel change le graphe de
+        # dependances, et l'engine n'est jamais recree entre deux appels (le
+        # slot_manager le garde). Sans invalidation, `get_symbol_cluster`
+        # continuerait de rendre le decoupage d'avant l'edition.
+        if self._communities is None or self._communities_version != self.index.files_version:
             self._communities = compute_communities(self.index)
+            self._communities_version = self.index.files_version
         return self._communities
 
     def _get_aggregated_dependencies(self, resolved_name: str) -> set[str] | None:

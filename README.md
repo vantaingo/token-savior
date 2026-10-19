@@ -16,6 +16,12 @@
 **[mibayy.github.io/token-savior](https://mibayy.github.io/token-savior/)** -- project site + benchmark landing
 Benchmark source + fixtures: not currently published (see *Reproducing the score* below)
 
+<a href="https://github.com/Mibayy/token-savior/releases/download/v4.23.2/token-savior-v4-23.mp4">
+  <img src="docs/media/v4-23-preview.gif" width="800" alt="Plain Claude Code against Claude Code + Token Savior: 92,609 vs 38,150 new tokens, cost -45%">
+</a>
+
+<sub>v4.23 in 31 seconds, measured on 2026-10-07 · <a href="https://github.com/Mibayy/token-savior/releases/download/v4.23.2/token-savior-v4-23.mp4">watch the full video (MP4, sound on)</a></sub>
+
 ---
 
 ### Benchmark -- 96 real coding tasks (Claude Opus 4.7, May 2026)
@@ -45,7 +51,32 @@ must assert that its tools were actually called.** Ours did not, so it happily
 compared two identical agents. That assertion now exists in the harness.
 
 The headline figures above therefore stand as reported and unverified, as
-stated in the previous paragraph. Re-measuring them properly is open work.
+stated in the previous paragraph.
+
+**Re-measured on 2026-10-07, with the tools actually called.** Same 8 tasks
+on a frozen copy of this repo (commit `9d15a1e`, no `CLAUDE.md`), Claude
+Haiku 4.5, plain Claude Code against the `auto` profile with `alwaysLoad`.
+The harness checks that the Token Savior sessions really called the server.
+
+| 3 passes, mean ± sd | Plain Claude Code | **v4.23.0 `auto`** |
+|---|---:|---:|
+| **Cost, 8 tasks** | $0.226 ± 0.011 | **$0.123 ± 0.020 (-45%, range -39% to -53%)** |
+| **New tokens** | 92 609 ± 6 731 | **38 150 ± 7 618 (-59%)** |
+| **Sessions that used TS** | — | **23 / 24** |
+| **Wall time, 8 tasks** | 157 ± 26 s | 216 ± 9 s (+40%) |
+
+All 48 sessions succeeded. v4.22.0, measured once, saved 14% and used the tools
+in 5 sessions out of 8. Editing, measured on 2026-10-08 on the same repository (3 tasks in files of
+1 900 to 3 700 lines, graded by running the code and the module's tests,
+4 passes): every session of both arms succeeded, and cost is too noisy to call
+a gain (from -54% to +16% per pass). Native `Edit` only needs a partial
+`Read`, so there is little left to remove there.
+
+Wall time is worse because each benchmark session starts a fresh server that
+indexes the repo first; a long-lived session pays that once. What moved from
+v4.22.0 to v4.23.0 is mostly wording: `search_codebase` now names the function
+holding each hit, and the tool descriptions say plainly which native call they
+replace.
 
 </div>
 
@@ -92,6 +123,7 @@ Add to your MCP config (e.g. Claude Code):
   "mcpServers": {
     "token-savior-recall": {
       "command": "/path/to/venv/bin/token-savior",
+      "alwaysLoad": true,
       "env": {
         "WORKSPACE_ROOTS": "/path/to/project1,/path/to/project2",
         "TOKEN_SAVIOR_CLIENT": "claude-code",
@@ -101,6 +133,12 @@ Add to your MCP config (e.g. Claude Code):
   }
 }
 ```
+
+**`"alwaysLoad": true`** matters on Claude Code (2.1.28x and later): without
+it, every tool of the server sits behind ToolSearch and the model reaches for
+`Read` and `Grep`, which are already loaded. Measured on this project's
+benchmark before the option existed: one session in 143 called a Token Savior
+tool. With it, the manifest costs a few thousand cached tokens per session.
 
 That's it. **`TOKEN_SAVIOR_PROFILE=optimized`** ships the Pareto-optimum
 config that wins tsbench. It bundles:
@@ -269,7 +307,7 @@ out in #45.
 | RTK (repo currently unreachable) | PostToolUse Bash output compression | Same layer, same PostToolUse limit: neither shrinks the current turn | Pick one. `TS_BASH_COMPACT=0` to defer to RTK |
 | [serena](https://github.com/oraios/serena) | Symbol-graph navigation | Direct, with `find_symbol` / `get_dependents` | Run TS as `compact-only` if serena is your navigator |
 | codebase-memory | Persistent code graph | With the memory engine | `TS_MEMORY_DISABLE=1` |
-| Ponytail, Caveman | Output-side compression (code and prose) | Partial, output side only | Complementary, no knob needed |
+| [Ponytail](https://github.com/DietrichGebert/ponytail), Caveman | Output-side compression (code and prose) | Partial: Token Savior ships an opt-in Ponytail-style discipline (`TS_DISCIPLINE=1`) wired to its tools | Complementary, no knob needed |
 
 The layers Token Savior owns that these do not: the PreToolUse Bash **rewriter**
 (it shrinks the command before it runs, not the output after), structural
@@ -405,7 +443,12 @@ values shown as *bool* accept `1`/`true`/`yes` (and `on` where noted).
 | `TS_STICKY_ACTIVE` | off (*bool*, `on` ok) | Freeze the active project: explicit `project=` hints and absolute path arguments still route each call, but no call repoints the shared default. For parallel agents in sibling worktrees |
 | `TOKEN_SAVIOR_PROFILE` | `full` | Tool profile. `optimized` — the value the quickstart config and `ts init` recommend — ships the Pareto manifest, implies thin schemas, and omits the capture tools from the manifest |
 | `TS_THIN_SCHEMAS=1` | off (on in `optimized`) | Strip verbose tool schemas from the manifest |
-| `TS_AUTO_HOT_K` | `10` | Hot-tool count exposed by the telemetry-driven `auto` profile |
+| `TS_DISCIPLINE` | off (*bool*) | Session instructions in the style of Ponytail: smallest complete change scoped by `get_edit_context`, reuse found by `search_codebase`, one closing line on what was skipped. Off by default: on tsbench they cost 3-4 % more per session with no measured gain |
+| `TS_PROMPTS` | on (*bool*) | The `review` / `audit` / `lean` MCP prompts (slash commands in Claude Code). Free until called. `0` removes them |
+| `TS_AUTO_HOT_K` | `8` | Hot-tool count exposed by the telemetry-driven `auto` profile (13 tools in all) |
+| `TS_LEVEL_BANDIT` | off | Let a Thompson-sampling bandit pick the detail level of `get_function_source` / `get_class_source` when no `level` is given. Off by default: it drifted to summaries in place of source |
+| `TS_EXECUTE_MAX_CHARS` | `60000` | Ceiling on a `ts_execute` result; past it the returned value is cut and the cut is reported |
+| `TS_GUARD_READ_FREE_LINES` | `200` | Discipline guard: whole-file `Read` of indexed code passes up to this many lines |
 | `TOKEN_SAVIOR_CHAIN_NUDGE` | on | `0`/`false`/`off` disables chained-tool nudges |
 | `TS_MEMORY_DISABLE=1` | off | Disable the memory engine (clean-context workloads) |
 | `TS_CAPTURE_DISABLED=1` | off | Skip read-side capture sandboxing and drop the capture tools from the manifest (no profile flips this; `optimized` only hides the capture tools) |

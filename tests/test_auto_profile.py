@@ -70,8 +70,10 @@ def test_auto_promotes_top_K_from_telemetry():
         telemetry.aggregate_counts = orig
 
     # Always-on essentials
-    for must in ("ts_search", "ts_execute", "switch_project", "list_projects"):
+    for must in ("ts_execute", "switch_project", "list_projects", "get_edit_context"):
         assert must in includes, f"missing essential: {must}"
+    # Redondants jamais promus, même haut dans la télémétrie (07/10/2026).
+    assert "get_git_status" not in includes
     # Top-10 hot tools (excluding essentials already in the set)
     for hot in ("find_symbol", "get_function_source", "search_codebase",
                 "get_full_context", "replace_symbol_source"):
@@ -121,3 +123,18 @@ def test_full_profile_does_not_emit_deprecation(capsys, monkeypatch):
     _reload_server(monkeypatch, "full")
     captured = capsys.readouterr()
     assert "DEPRECATED" not in captured.err
+
+
+def test_les_outils_retires_du_profil_restent_joignables_par_ts_execute():
+    """Un outil sorti du manifeste chargé d'office doit rester appelable via
+    ts_execute (07/10/2026 : move_symbol ne l'était plus nulle part)."""
+    import re
+    from pathlib import Path
+
+    from token_savior import server as srv
+    facade = Path(srv.__file__).parent / "code_mode" / "facade.py"
+    autorises = set(re.findall(r'"([a-z_]+)"', facade.read_text(encoding="utf-8")))
+    # ts_search est la découverte d'outils elle-même ; set_project_root est couvert
+    # par switch_project, qui enregistre un chemin inconnu (outil annoncé).
+    for nom in srv._AUTO_REDONDANTS - {"ts_search", "set_project_root"}:
+        assert nom in autorises, f"{nom} n'est plus joignable"

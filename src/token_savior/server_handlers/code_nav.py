@@ -347,6 +347,28 @@ def _require_name(args: dict[str, Any], tool: str, *, batch: bool = False) -> st
     )
 
 
+def _niveau_de_source(args: dict[str, Any]) -> tuple[int, str | None]:
+    """Niveau de détail rendu par get_function_source / get_class_source.
+
+    Le code complet (niveau 0) par défaut. Le choix automatique par Thompson
+    sampling ne joue plus que si `TS_LEVEL_BANDIT=1`.
+
+    Mesuré le 07/10/2026 : l'apprentissage notait « succès » toute réponse non
+    vide, y compris un résumé [L2] qui ne contenait pas le code demandé, et
+    ne notait jamais d'échec (une redemande avec `level` explicite n'enregistre
+    rien). Il avait dérivé jusqu'à 5 284 succès pour [L2] contre 34 pour le
+    code : sur 30 jours, 61 des 95 appels sans `level` ont rendu un résumé ou
+    une signature au lieu de la source, et les agents passaient `level=0` à
+    la main pour s'en sortir.
+    """
+    if "level" in args and args.get("level") is not None:
+        return int(args.get("level") or 0), None
+    if os.environ.get("TS_LEVEL_BANDIT") != "1":
+        return 0, None
+    ctx_type = memory_db._detect_context_type(state._prefetcher.call_sequence)
+    return memory_db.thompson_sample_level(ctx_type), ctx_type
+
+
 def _q_get_class_source(qfns, args: dict[str, Any]) -> str:
     batch = _batch_dispatch(qfns, args, _q_get_class_source)
     if batch is not None:
@@ -355,13 +377,7 @@ def _q_get_class_source(qfns, args: dict[str, Any]) -> str:
     if missing:
         return missing
     slot, _ = state._slot_mgr.resolve(args.get("project"))
-    explicit_level = "level" in args and args.get("level") is not None
-    if explicit_level:
-        chosen_level = int(args.get("level") or 0)
-        ctx_type = None
-    else:
-        ctx_type = memory_db._detect_context_type(state._prefetcher.call_sequence)
-        chosen_level = memory_db.thompson_sample_level(ctx_type)
+    chosen_level, ctx_type = _niveau_de_source(args)
     result = _csc_maybe_serve(
         slot,
         "class",
@@ -382,7 +398,8 @@ def _q_get_class_source(qfns, args: dict[str, Any]) -> str:
             pass
     if not _HINTS_DISABLED and args.get("hints", True) and isinstance(result, str) and result and not result.startswith("Error"):
         if _navigation_calls_so_far() >= _OVER_EXPLORATION_THRESHOLD:
-            result += f"\n\n{_stop_hint()}"
+            if _stop_hint_due():
+                result += f"\n\n{_stop_hint()}"
         else:
             indice = (
                 f"\n\n→ get_full_context('{args['name']}') "
@@ -403,13 +420,7 @@ def _q_get_function_source(qfns, args: dict[str, Any]) -> str:
     from token_savior.server_runtime import _resolve_project_root
 
     slot, _ = state._slot_mgr.resolve(args.get("project"))
-    explicit_level = "level" in args and args.get("level") is not None
-    if explicit_level:
-        chosen_level = int(args.get("level") or 0)
-        ctx_type = None
-    else:
-        ctx_type = memory_db._detect_context_type(state._prefetcher.call_sequence)
-        chosen_level = memory_db.thompson_sample_level(ctx_type)
+    chosen_level, ctx_type = _niveau_de_source(args)
     result = _csc_maybe_serve(
         slot,
         "function",
@@ -470,7 +481,8 @@ def _q_get_function_source(qfns, args: dict[str, Any]) -> str:
         pass
     if not _HINTS_DISABLED and args.get("hints", True) and isinstance(result, str) and result and not result.startswith("Error"):
         if _navigation_calls_so_far() >= _OVER_EXPLORATION_THRESHOLD:
-            result += f"\n\n{_stop_hint()}"
+            if _stop_hint_due():
+                result += f"\n\n{_stop_hint()}"
         else:
             indice = (
                 f"\n\n→ get_full_context('{args['name']}') "
@@ -479,6 +491,51 @@ def _q_get_function_source(qfns, args: dict[str, Any]) -> str:
             if _indice_supportable(result, indice):
                 result += indice
     return result
+
+
+_SIBLINGS_MAX = 12
+_COMMENT_PREFIXES = ("#", "//", "/*", "*", "--", ";")
+
+
+def _ligne_de(entry: dict) -> int | None:
+    """Ligne de début d'une entrée get_functions / get_classes (« line » ou « lines »)."""
+    line = entry.get("line")
+    if line is None and isinstance(entry.get("lines"), (list, tuple)) and entry["lines"]:
+        line = entry["lines"][0]
+    return line if isinstance(line, int) else None
+
+
+def _intention_au_dessus(qfns, location) -> str | None:
+    """Commentaire collé au-dessus de la définition : l'intention que la source seule ne dit pas.
+
+    Repris de graphify, qui fait des « # WHY: » des nœuds à part entière. Ici on n'en
+    garde que le bloc contigu juste au-dessus du symbole, 8 lignes au plus.
+    """
+    if not isinstance(location, dict) or "get_lines" not in qfns:
+        return None
+    line, file = location.get("line"), location.get("file")
+    if not isinstance(line, int) or line <= 1 or not file:
+        return None
+    try:
+        texte = qfns["get_lines"](file, max(1, line - 8), line - 1)
+    except Exception:
+        return None
+    if not isinstance(texte, str):
+        return None
+    bloc: list[str] = []
+    for brute in reversed(texte.splitlines()):
+        ligne = brute.split("  ", 1)[-1] if brute[:6].strip().isdigit() else brute
+        s = ligne.strip()
+        if s.startswith("@"):  # décorateur entre le commentaire et la définition
+            continue
+        if not s or not s.startswith(_COMMENT_PREFIXES):
+            break
+        bloc.append(s)
+    # Les bandeaux de section (« # ---- », « # Tools ») ne disent rien de l'intention.
+    utiles = [ligne for ligne in bloc if any(c.isalnum() for c in ligne)]
+    if sum(len(ligne) for ligne in utiles) < 25:
+        return None
+    return "\n".join(reversed(utiles))
 
 
 def _q_get_edit_context(qfns, args):
@@ -492,8 +549,13 @@ def _q_get_edit_context(qfns, args):
     except Exception:
         location = None
     is_class = isinstance(location, dict) and location.get("type") == "class"
+    is_variable = (isinstance(location, dict)
+                   and location.get("type") in ("variable", "constant")
+                   and "get_variable_source" in qfns)
     try:
-        if is_class:
+        if is_variable:
+            ctx["source"] = qfns["get_variable_source"](sym_name, max_lines=200)
+        elif is_class:
             ctx["source"] = qfns["get_class_source"](sym_name, max_lines=200)
         else:
             ctx["source"] = qfns["get_function_source"](sym_name, max_lines=200)
@@ -515,6 +577,9 @@ def _q_get_edit_context(qfns, args):
     if isinstance(location, dict) and ctx.get("source"):
         location = {c: v for c, v in location.items() if c != "source_preview"}
     ctx["location"] = location
+    pourquoi = _intention_au_dessus(qfns, location)
+    if pourquoi:
+        ctx["why"] = pourquoi
     try:
         dependencies = qfns["get_dependencies"](sym_name, max_results=max_deps)
         if is_class:
@@ -544,7 +609,11 @@ def _q_get_edit_context(qfns, args):
     except Exception:
         ctx["callers"] = []
 
-    # --- siblings: other symbols in the same file ---
+    # --- siblings: les voisins les plus proches dans le fichier ---
+    # Mesure du 15/10/2026 : la liste complète pesait jusqu'à la moitié de la
+    # réponse (7 161 caractères sur 14 272 pour une méthode de query_api.py),
+    # avec des lignes toutes à null (la clé est « lines », pas « line »).
+    # On garde les 12 plus proches de la définition et le total.
     loc_file = location.get("file") if isinstance(location, dict) else None
     if loc_file:
         siblings = []
@@ -552,19 +621,23 @@ def _q_get_edit_context(qfns, args):
             for fn in qfns["get_functions"](file_path=loc_file, max_results=0):
                 fn_name = fn.get("name") if isinstance(fn, dict) else None
                 if fn_name and fn_name != sym_name:
-                    siblings.append({"name": fn_name, "type": "function",
-                                     "line": fn.get("line")})
+                    siblings.append({"name": fn_name, "type": "function", "line": _ligne_de(fn)})
         except Exception:
             pass
         try:
             for cls in qfns["get_classes"](file_path=loc_file, max_results=0):
                 cls_name = cls.get("name") if isinstance(cls, dict) else None
                 if cls_name and cls_name != sym_name:
-                    siblings.append({"name": cls_name, "type": "class",
-                                     "line": cls.get("line")})
+                    siblings.append({"name": cls_name, "type": "class", "line": _ligne_de(cls)})
         except Exception:
             pass
-        ctx["siblings"] = siblings
+        ici = location.get("line") if isinstance(location.get("line"), int) else None
+        if ici is not None:
+            siblings.sort(key=lambda s: abs((s["line"] if s["line"] is not None else 10**9) - ici))
+        if len(siblings) > _SIBLINGS_MAX:
+            ctx["siblings_total"] = len(siblings)
+            siblings = siblings[:_SIBLINGS_MAX]
+        ctx["siblings"] = [{k: v for k, v in s.items() if v is not None} for s in siblings]
     else:
         ctx["siblings"] = []
 
@@ -606,6 +679,18 @@ def _navigation_calls_so_far() -> int:
     return sum(state._tool_call_counts.get(t, 0) for t in _NAV_TOOLS)
 
 
+# Le conseil d'arrêt revient au seuil puis tous les 25 appels, pas à chaque
+# réponse. Le compteur couvre toute la vie du serveur, sous-agents compris :
+# relevé du 07/10/2026, une session de travail normale le dépassait en une
+# heure et payait ensuite ~340 caractères identiques sur chaque appel.
+_STOP_HINT_EVERY = 25
+
+
+def _stop_hint_due(n: int | None = None) -> bool:
+    n = _navigation_calls_so_far() if n is None else n
+    return n >= _OVER_EXPLORATION_THRESHOLD and (n - _OVER_EXPLORATION_THRESHOLD) % _STOP_HINT_EVERY == 0
+
+
 def _stop_hint() -> str:
     n = _navigation_calls_so_far()
     return (
@@ -638,7 +723,7 @@ def _indice_supportable(reponse: str, indice: str) -> bool:
 
 def _hints_for_symbol(name: str, sym_type: str | None) -> list[str]:
     if _navigation_calls_so_far() >= _OVER_EXPLORATION_THRESHOLD:
-        return [_stop_hint()]
+        return [_stop_hint()] if _stop_hint_due() else []
     source_tool = "get_class_source" if sym_type == "class" else "get_function_source"
     return [
         f"full_context: get_full_context('{name}')",
@@ -797,6 +882,33 @@ def _suggest_if_empty_search(result, pattern: str):
     return result
 
 
+# Au-dela, Claude Code refuse le resultat et le depose dans un fichier : 5
+# appels search_codebase(max_results=0) sur 30 jours (06/10/2026) ont rendu
+# de 107 000 a 192 000 caracteres, soit une erreur au lieu d'une reponse.
+_BUDGET_RECHERCHE_SANS_BORNE = 60_000
+
+
+def _borner_recherche_sans_borne(result, args: dict[str, Any]):
+    """`max_results=0` veut dire « pas de plafond en nombre », pas « depasse
+    la fenetre » : on coupe au budget de caracteres et on le dit."""
+    if args.get("max_results", 100) != 0 or not isinstance(result, list):
+        return result
+    total = 0
+    for i, hit in enumerate(result):
+        total += len(json.dumps(hit, ensure_ascii=False)) + 1
+        if total > _BUDGET_RECHERCHE_SANS_BORNE:
+            fichiers = len({h.get("file") for h in result if isinstance(h, dict)})
+            return {
+                "matches": result[:i],
+                "_tronque": (
+                    f"{len(result)} correspondances dans {fichiers} fichiers, "
+                    f"{i} rendues ({_BUDGET_RECHERCHE_SANS_BORNE} caracteres). "
+                    f"Resserre le motif, ou cible un fichier avec read_lines."
+                ),
+            }
+    return result
+
+
 def _suggest_if_empty_dependents(result, name: str):
     if isinstance(result, list) and len(result) == 0:
         if _HINTS_DISABLED:
@@ -913,6 +1025,12 @@ def _read_lines_enclosing(qfns, file_path: str, start: int, end: int) -> str | N
     Sert l'unique reproche qu'on peut faire a une lecture par plage : elle ne
     dit pas de quoi elle est un morceau. Repondre "ces lignes sont dans
     Foo.bar (98-160)" evite la relecture a l'aveugle de la plage suivante.
+
+    Quand aucun symbole ne couvre toute la plage, on nomme celui qui contient
+    la PREMIERE ligne. Au banc du 07/10/2026, « quelle fonction contient la
+    ligne 145 » coutait trois read_lines : la fenetre par defaut (60 lignes)
+    debordait sur la fonction suivante, aucun nom ne sortait, et le modele
+    relisait en resserrant.
     """
     try:
         symboles = qfns["get_functions"](file_path, max_results=0)
@@ -921,6 +1039,7 @@ def _read_lines_enclosing(qfns, file_path: str, start: int, end: int) -> str | N
     if not isinstance(symboles, list):
         return None
     meilleur = None
+    premiere = None
     for sym in symboles:
         if not isinstance(sym, dict):
             continue
@@ -930,18 +1049,63 @@ def _read_lines_enclosing(qfns, file_path: str, start: int, end: int) -> str | N
         debut, fin = bornes
         if not (isinstance(debut, int) and isinstance(fin, int)):
             continue
+        nom = sym.get("qualified_name") or sym.get("name")
         # Le plus serre gagne : une methode plutot que la classe qui la porte.
         if (
             debut <= start
             and end <= fin
             and (meilleur is None or (fin - debut) < (meilleur[2] - meilleur[1]))
         ):
-            meilleur = (sym.get("qualified_name") or sym.get("name"), debut, fin)
-    if meilleur is None or not meilleur[0]:
+            meilleur = (nom, debut, fin)
+        if debut <= start <= fin and (premiere is None or (fin - debut) < (premiere[2] - premiere[1])):
+            premiere = (nom, debut, fin)
+    if meilleur and meilleur[0]:
+        return f"{meilleur[0]} (lines {meilleur[1]}-{meilleur[2]})"
+    if premiere and premiere[0]:
+        return f"{premiere[0]} (lines {premiere[1]}-{premiere[2]}, which holds line {start})"
+    return None
+
+
+_HORS_INDEX_MAX_OCTETS = 5 * 1024 * 1024
+
+
+def _lire_hors_index(qfns, file_path: str, start: int, end: int) -> str | None:
+    """Lit une plage d'un fichier present sur disque mais absent de l'index.
+
+    Releve du 06/10/2026 sur 30 jours : 17 des 19 echecs de read_lines etaient
+    « file not found in index » sur un fichier qui existait bien (un `.mjs`
+    jamais indexe, un depot non enregistre comme /root/rhwatch). L'erreur
+    renvoyait l'appelant vers list_files ou switch_project, et en pratique
+    vers `sed -n` en Bash. Lire ce que `sed` aurait lu, sans symbole
+    englobant, rend le meme service sans quitter l'outil.
+
+    Chemin absolu, ou relatif a la racine du projet actif. Fichier regulier
+    de moins de 5 Mo, sans octet nul : pas de binaire.
+    """
+    racine = None
+    try:
+        racine = qfns["get_lines"].__self__.index.root_path
+    except (AttributeError, KeyError, TypeError):
+        pass
+    chemin = os.path.expanduser(file_path)
+    if not os.path.isabs(chemin):
+        if not racine:
+            return None
+        chemin = os.path.join(racine, chemin)
+    try:
+        if not os.path.isfile(chemin) or os.path.getsize(chemin) > _HORS_INDEX_MAX_OCTETS:
+            return None
+        with open(chemin, "rb") as f:
+            octets = f.read()
+    except OSError:
         return None
-    return f"{meilleur[0]} (lines {meilleur[1]}-{meilleur[2]})"
-
-
+    if b"\0" in octets[:8192]:
+        return None
+    lignes = octets.decode("utf-8", errors="replace").split("\n")
+    if start > len(lignes):
+        return (f"Error: start ({start}) is past the end of '{file_path}' "
+                f"({len(lignes)} lines).")
+    return "\n".join(lignes[start - 1:end])
 def _q_read_lines(qfns, args: dict[str, Any]):
     """Lecture par plage de lignes — le cas ou l'appelant tient un numero.
 
@@ -982,6 +1146,11 @@ def _q_read_lines(qfns, args: dict[str, Any]):
     brut = qfns["get_lines"](file_path, start, end)
     if not isinstance(brut, str):
         return brut
+    hors_index = None
+    if brut.startswith("Error:") and "not found in index" in brut:
+        hors_index = _lire_hors_index(qfns, file_path, start, end)
+        if hors_index is not None:
+            brut = hors_index
     if brut.startswith("Error:"):
         if "not found in index" in brut:
             return (
@@ -1006,7 +1175,9 @@ def _q_read_lines(qfns, args: dict[str, Any]):
             f"[tronque a {cap} lignes — relance avec start={end + 1}, "
             f"ou max_lines=0 pour lever le plafond]"
         )
-    if args.get("hints", True) and not _HINTS_DISABLED:
+    if hors_index is not None:
+        suffixes.append("[lu sur disque : fichier hors index, pas de symbole englobant]")
+    elif args.get("hints", True) and not _HINTS_DISABLED:
         englobant = _read_lines_enclosing(qfns, file_path, start, start + len(lignes) - 1)
         if englobant:
             nom = englobant.split(" (")[0]
@@ -1056,7 +1227,7 @@ QFN_HANDLERS: dict[str, object] = {
     "get_file_dependents": lambda q, a: q["get_file_dependents"](
         a["file_path"], max_results=a.get("max_results", 0)
     ),
-    "search_codebase": lambda q, a: _suggest_if_empty_search(
+    "search_codebase": lambda q, a: _borner_recherche_sans_borne(_suggest_if_empty_search(
         q["search_codebase"](
             a["pattern"],
             max_results=a.get("max_results", 100),
@@ -1064,7 +1235,7 @@ QFN_HANDLERS: dict[str, object] = {
             semantic=a.get("semantic", False),
         ),
         a["pattern"],
-    ),
+    ), a),
     "search_in_symbols": lambda q, a: _suggest_if_empty_search(
         q["search_in_symbols"](a["pattern"], max_results=a.get("max_results", 100)),
         a["pattern"],

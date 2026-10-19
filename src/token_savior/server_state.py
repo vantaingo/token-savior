@@ -39,7 +39,12 @@ def get_server():
     global _server_singleton
     if _server_singleton is None:
         from mcp.server import Server  # lazy : ~1.24s SDK MCP load
-        _server_singleton = Server("token-savior-recall")
+
+        from token_savior.server_handlers import discipline
+        try:
+            _server_singleton = Server("token-savior-recall", instructions=discipline.instructions())
+        except TypeError:  # SDK trop ancien pour les instructions de serveur
+            _server_singleton = Server("token-savior-recall")
     return _server_singleton
 
 
@@ -91,7 +96,10 @@ def __getattr__(name):
 # Persistent cache versioning
 # ---------------------------------------------------------------------------
 
-_CACHE_VERSION: int = 4  # Bumped: C# annotator now fills dependency_graph (was 3: variables + variable_table)
+# 5: merge of two independent bumps to 4 (fork: C# annotator fills
+# dependency_graph; upstream 06/10/2026: .mjs/.cjs indexed, TS/JS module
+# bindings as variables), so a cache built by either side is rebuilt.
+_CACHE_VERSION: int = 5
 
 # ---------------------------------------------------------------------------
 # Project state — slot manager owns the project dict and active root
@@ -282,6 +290,9 @@ _STICKY_ACTIVE: bool = (
 # deductions later. Measured 2026-08-05: a search meant for this repository
 # returned a competitor's files, well-formed and entirely wrong.
 _racines_actives_vues: set[str] = set()
+# Vrai seulement dans un serveur lancé par main() (autodiscover_and_register) :
+# les tests qui changent de projet ne doivent pas écrire le fichier de l'utilisateur.
+_memoriser_actif: bool = False
 
 
 def noter_racine_active(root: str) -> bool:
@@ -295,6 +306,9 @@ def noter_racine_active(root: str) -> bool:
     if _STICKY_ACTIVE:
         return True
     _slot_mgr.active_root = root
+    if _memoriser_actif:
+        from token_savior.slot_manager import memoriser_actif
+        memoriser_actif(root)
     return False
 
 

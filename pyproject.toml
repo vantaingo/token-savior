@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "token-savior-recall"
-version = "4.21.0"
+version = "4.24.0"
 description = "Optimized MCP server for AI coding agents. Structural codebase navigation + persistent memory engine — 97.9% accuracy at −80% tokens on tsbench."
 requires-python = ">=3.11"
 readme = "README.md"
@@ -25,7 +25,7 @@ classifiers = [
 # Without one, an upstream release breaks existing installs with no commit
 # on our side; bumping a bound is a deliberate act, made here.
 dependencies = [
-    "mcp>=1.25,<2",
+    "mcp>=1.25,<3",
     "PyYAML>=6.0,<7",
     "tree-sitter>=0.25,<0.26",
     "tree-sitter-java>=0.23,<0.24",
@@ -37,7 +37,7 @@ dependencies = [
 # Conserve pour compatibilite : `pip install "token-savior-recall[mcp]"`
 # est publie dans le README et sur PyPI depuis la v2. `mcp` est
 # desormais une dependance de base, cet extra ne fait plus rien.
-mcp = ["mcp>=1.25,<2"]
+mcp = ["mcp>=1.25,<3"]
 # ruff is pinned, not floated, so preflight and CI always agree on the rule
 # set. Moving this pin is a deliberate act: bump it together with whatever
 # cleanup the new defaults demand, in the same commit. The 0.15.9 -> 0.16.0
@@ -45,7 +45,10 @@ mcp = ["mcp>=1.25,<2"]
 # by default; see [tool.ruff.lint] for the three rules we opted back out of).
 dev = ["build>=1.2,<2", "pytest>=8.0,<9", "ruff==0.16.0"]
 benchmark = ["aiohttp>=3.9,<4"]
-memory-vector = ["sqlite-vec>=0.1,<2", "fastembed>=0.4,<2", "onnxruntime>=1.16,<2"]
+# onnxruntime < 1.30 : mesure du 07/10/2026, meme code, meme fastembed, le banc
+# code_retrieval passe de MRR@10 0,6708 (1.28) a 0,6317 (1.30). Lever le
+# plafond quand le banc le tolere, pas avant.
+memory-vector = ["sqlite-vec>=0.1,<2", "fastembed>=0.4,<2", "onnxruntime>=1.16,<1.30"]
 
 [project.scripts]
 ts = "token_savior.cli:main"
