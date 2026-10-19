@@ -198,7 +198,12 @@ def test_ts_execute_in_tool_manifest():
     names = {t.name for t in TOOLS}
     assert "ts_execute" in names
     spec = next(t for t in TOOLS if t.name == "ts_execute")
-    assert "script" in spec.inputSchema.get("required", [])
+    schema = spec.inputSchema
+    # Fork #2: aliased `script` leaves `required` and no top-level anyOf is
+    # emitted; its absence is reported at dispatch.
+    assert "script" in schema["properties"]
+    assert "script" not in schema.get("required", [])
+    assert "anyOf" not in schema
 
 
 @pytest.mark.skipif(

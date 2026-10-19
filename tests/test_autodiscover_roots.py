@@ -29,6 +29,7 @@ def make_project(base, name: str, marker: str = ".git"):
     d.mkdir(parents=True, exist_ok=True)
     if marker == ".git":
         (d / ".git").mkdir()
+        (d / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     else:
         (d / marker).write_text("{}", encoding="utf-8")
     return d
@@ -208,6 +209,7 @@ def _worktree_imbrique(tmp_path):
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / ".git").mkdir()
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     wt = repo / ".claude" / "worktrees" / "fix-98"
     wt.mkdir(parents=True)
     (wt / ".git").write_text("gitdir: ../../../.git/worktrees/fix-98\n")
@@ -312,3 +314,52 @@ def test_root_delibere_l_emporte_sur_le_worktree_de_lancement(tmp_path, monkeypa
     rt.autodiscover_and_register()
     assert str(wt) in mgr.projects, "le worktree garde son slot"
     assert mgr.active_root == str(repo), "un choix humain explicite n'est pas renverse"
+
+
+def test_un_git_vide_ne_fait_pas_un_projet(tmp_path) -> None:
+    """Panne du 06/10/2026 : un `/tmp/.git` vide faisait de tout /tmp un depot."""
+    from token_savior.server_runtime import is_project_dir
+    (tmp_path / ".git").mkdir()
+    assert not is_project_dir(str(tmp_path))
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    assert is_project_dir(str(tmp_path))
+
+
+def test_le_dossier_temporaire_n_est_jamais_une_racine(tmp_path, monkeypatch) -> None:
+    from token_savior.server_runtime import project_root_of
+    faux_tmp = tmp_path / "tmp"
+    (faux_tmp / ".git").mkdir(parents=True)
+    (faux_tmp / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (faux_tmp / "clone" / "src").mkdir(parents=True)
+    monkeypatch.setenv("TMPDIR", str(faux_tmp))
+    import tempfile
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    assert project_root_of(str(faux_tmp / "clone" / "src")) is None
+
+
+def _fausse_maison(tmp_path, monkeypatch):
+    maison = tmp_path / "maison"
+    (maison / ".git").mkdir(parents=True)
+    (maison / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(maison))
+    return maison
+
+
+def test_le_dossier_personnel_versionne_est_un_conteneur(tmp_path, monkeypatch) -> None:
+    """07/10/2026 : /root est un dépôt git ; /root/claude-chat (sans marqueur)
+    se résolvait en /root entier, index plafonné à 10 000 fichiers."""
+    from token_savior.server_runtime import project_root_of
+    maison = _fausse_maison(tmp_path, monkeypatch)
+    (maison / "chat" / "public").mkdir(parents=True)
+    (maison / "chat" / "public" / "app.js").write_text("x\n", encoding="utf-8")
+    assert project_root_of(str(maison / "chat" / "public" / "app.js")) == str(maison / "chat")
+    assert project_root_of(str(maison / "chat")) == str(maison / "chat")
+    assert project_root_of(str(maison)) is None, "le dossier personnel n'est jamais un projet"
+
+
+def test_un_vrai_projet_sous_la_maison_garde_sa_racine(tmp_path, monkeypatch) -> None:
+    from token_savior.server_runtime import project_root_of
+    maison = _fausse_maison(tmp_path, monkeypatch)
+    p = make_project(maison, "depot")
+    (p / "src").mkdir()
+    assert project_root_of(str(p / "src")) == str(p)

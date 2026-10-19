@@ -173,6 +173,9 @@ _ARG_ALIASES: dict[str, dict[str, str]] = {
     "read_lines": {"file": "file_path", "path": "file_path", "line": "start",
                    "start_line": "start", "end_line": "end"},
     "ts_search": {"pattern": "query", "q": "query"},
+    # 8 des 30 echecs de ts_execute sur 30 jours (06/10/2026) : le script
+    # envoye sous `code`, le nom que replace_symbol_source accepte deja.
+    "ts_execute": {"code": "script", "body": "script", "js": "script"},
 }
 
 
@@ -393,12 +396,14 @@ _CODE_MODE_INCLUDES: set[str] = {
 # Total manifest ~2-3 KT, converges to the user's actual usage after a
 # handful of sessions. Defaults to TINY_PLUS_INCLUDES on cold start
 # (no telemetry yet) to avoid a bad first-session experience.
-_AUTO_HOT_K = int(os.environ.get("TS_AUTO_HOT_K", "10"))
+_AUTO_HOT_K = int(os.environ.get("TS_AUTO_HOT_K", "8"))
+# Retirés des essentiels le 07/10/2026 sur 30 jours de transcriptions :
+# move_symbol 0 appel, ts_search 1, get_git_status 11 (git en Bash fait aussi
+# bien). Chaque outil annoncé coûte ~230 jetons dans un préfixe chargé
+# d'office (alwaysLoad). Ils restent appelables par leur nom et via ts_execute.
 _AUTO_ESSENTIALS: set[str] = {
     "switch_project",
     "list_projects",
-    "get_git_status",
-    "ts_search",
     "ts_execute",
     # Les trois primitives d'edition que le classement par usage ne peut pas
     # faire remonter, parce qu'il se mord la queue : un outil qui n'est pas
@@ -409,8 +414,16 @@ _AUTO_ESSENTIALS: set[str] = {
     # discipline, c'etait un cliquet. Les essentiels sont la sortie prevue.
     "get_edit_context",
     "insert_near_symbol",
-    "move_symbol",
+    # Pas edit_lines_in_symbol : essaye le 08/10/2026 sur le banc d'edition
+    # reel (4 passes), il n'a rien gagne. L'Edit natif se contente d'une lecture
+    # partielle (Read limit=100), et pour un renommage le modele a enchaine un
+    # appel par fonction (23 tours, 0,21 $) au lieu d'un Edit replace_all (6
+    # tours, 0,04 $). Il reste appelable via ts_execute.
 }
+# Jamais promus par l'usage : un autre outil annoncé fait déjà leur travail.
+# set_project_root -> switch_project enregistre un chemin inconnu ;
+# get_functions -> get_structure_summary. Le compteur à vie les gardait en tête.
+_AUTO_REDONDANTS: set[str] = {"set_project_root", "get_functions", "get_git_status", "move_symbol", "ts_search"}
 
 
 def _auto_includes() -> set[str]:
@@ -434,7 +447,7 @@ def _auto_includes() -> set[str]:
     ranked = sorted(eligible.items(), key=lambda kv: -kv[1])
     hot: list[str] = []
     for name, _n in ranked:
-        if name in _AUTO_ESSENTIALS:
+        if name in _AUTO_ESSENTIALS or name in _AUTO_REDONDANTS:
             continue
         hot.append(name)
         if len(hot) >= _AUTO_HOT_K:
@@ -970,6 +983,13 @@ def _locate_across_projects(file_hint: str) -> str:
 
 
 
+def _est_erreur_hors_index(result: Any) -> bool:
+    """Vrai pour une erreur « not found in index », faux pour une lecture
+    reussie dont le TEXTE contient ces mots (voir l'appelant)."""
+    return (isinstance(result, str) and result.startswith("Error")
+            and "not found in index" in result.split("\n", 1)[0])
+
+
 def _message_argument_obligatoire(name: str, exc: KeyError) -> str | None:
     """Message utile quand la cle absente est un argument declare obligatoire.
 
@@ -1110,7 +1130,12 @@ def _dispatch_tool(name: str, arguments: dict[str, Any], record_symbol: str) -> 
                     return _count_and_wrap_result(slot, name, arguments, cached)
                 s._src_misses += 1
             result = qfn_handler(slot.query_fns, arguments)
-            if isinstance(result, str) and "not found in index" in result:
+            # Sur la premiere ligne d'une erreur seulement. Le test portait sur
+            # tout le texte rendu : lire un code qui contient lui-meme cette
+            # chaine (ce handler, par exemple) collait « Found in project » a
+            # une lecture reussie, et la piste finissait recopiee dans la
+            # source par un replace_symbol_source (vecu le 06/10/2026).
+            if _est_erreur_hors_index(result):
                 piste = _locate_across_projects(str(arguments.get("file_path") or ""))
                 if piste:
                     result += piste
@@ -1331,7 +1356,40 @@ async def _handle_ts_execute(arguments: dict[str, Any]) -> list[types.TextConten
             "donc seule une valeur explicitement rendue remonte."
         )
 
-    return [TextContent(type="text", text=_json.dumps(outcome, indent=2, default=str))]
+    return [TextContent(type="text", text=_borner_sortie_script(outcome))]
+
+
+# Au-delà, Claude Code refuse le résultat et le dépose dans un fichier : le
+# script a tourné, mais l'appelant n'en voit rien (vécu le 07/10/2026, un
+# script qui relisait quatre fichiers entiers rendait 57 545 caractères).
+_TS_EXECUTE_BUDGET = int(os.environ.get("TS_EXECUTE_MAX_CHARS", "60000"))
+
+
+def _borner_sortie_script(outcome: dict) -> str:
+    """Sérialise le résultat de ts_execute en restant sous le budget.
+
+    La valeur rendue par le script est coupée en premier, en gardant logs,
+    erreur et compteurs intacts, et la coupure est dite avec la taille
+    d'origine : l'appelant sait qu'il doit rendre moins (un résumé, une
+    sélection) plutôt que croire avoir tout reçu.
+    """
+    import json as _json
+    texte = _json.dumps(outcome, indent=2, default=str)
+    if len(texte) <= _TS_EXECUTE_BUDGET:
+        return texte
+    compact = _json.dumps(outcome, default=str)
+    if len(compact) <= _TS_EXECUTE_BUDGET:
+        return compact
+    valeur = _json.dumps(outcome.get("value"), default=str)
+    reste = {k: v for k, v in outcome.items() if k != "value"}
+    place = max(2000, _TS_EXECUTE_BUDGET - len(_json.dumps(reste, default=str)) - 400)
+    reste["value"] = valeur[:place]
+    reste["_tronque"] = (
+        f"valeur rendue coupée à {place} caractères sur {len(valeur)} "
+        f"(budget TS_EXECUTE_MAX_CHARS={_TS_EXECUTE_BUDGET}). Rends moins depuis le "
+        "script : un extrait, des longueurs, ou un appel par fichier."
+    )
+    return _json.dumps(reste, default=str)
 
 
 # Request lifecycle logging is opt-in via TOKEN_SAVIOR_TRACE=1.
@@ -1456,6 +1514,69 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list:
 # ---------------------------------------------------------------------------
 
 
+def _sdk_mcp_majeur() -> int:
+    """Version majeure du SDK MCP installe (1 par defaut si illisible)."""
+    try:
+        from importlib.metadata import version
+        return int(version("mcp").split(".", 1)[0])
+    except Exception:
+        return 1
+
+
+def _serveur_sdk2():
+    """Serveur pour le SDK MCP 2.x, qui parle le protocole 2026-07-28.
+
+    Claude Code negocie ce protocole par defaut sur stdio depuis la 2.1.292 ;
+    un serveur qui ne le comprend pas coute une connexion lente, puis sept
+    jours memorises en mode ancien. Le SDK 2.x sert les deux epoques dans la
+    meme boucle (le premier message du client decide), mais il a retire les
+    decorateurs `list_tools()` / `call_tool()` au profit de rappels passes
+    au constructeur. Les handlers restent les memes : seule l'enveloppe change.
+    """
+    import inspect
+
+    from mcp import types as t
+    from mcp.server.lowlevel import Server
+
+    from token_savior.server_handlers import discipline
+
+    async def on_list_tools(ctx, params):
+        return t.ListToolsResult(tools=await list_tools())
+
+    async def on_call_tool(ctx, params):
+        contenu = await call_tool(params.name, dict(params.arguments or {}))
+        return t.CallToolResult(content=contenu)
+
+    rappels: dict[str, Any] = {"on_list_tools": on_list_tools, "on_call_tool": on_call_tool}
+    if os.environ.get("TS_RESOURCES_DISABLED", "").lower() not in ("1", "true", "yes"):
+        from token_savior.server_handlers import resources as _res
+
+        async def on_list_resources(ctx, params):
+            try:
+                return t.ListResourcesResult(resources=_res.list_observation_resources())
+            except Exception:
+                return t.ListResourcesResult(resources=[])
+
+        async def on_read_resource(ctx, params):
+            texte = _res.read_observation_resource(params.uri)
+            return t.ReadResourceResult(contents=[t.TextResourceContents(
+                uri=params.uri, mimeType="text/markdown", text=texte)])
+
+        rappels.update(on_list_resources=on_list_resources, on_read_resource=on_read_resource)
+
+    async def on_list_prompts(ctx, params):
+        return t.ListPromptsResult(prompts=discipline.list_prompts())
+
+    async def on_get_prompt(ctx, params):
+        return discipline.get_prompt(params.name, dict(params.arguments or {}))
+
+    # Instructions et prompts : on ne passe que ce que ce SDK accepte, pour ne
+    # jamais casser le demarrage sur une version qui ne les connait pas.
+    accepte = inspect.signature(Server.__init__).parameters
+    extras: dict[str, Any] = {"on_list_prompts": on_list_prompts, "on_get_prompt": on_get_prompt,
+                              "instructions": discipline.instructions()}
+    rappels.update({k: v for k, v in extras.items() if k in accepte and v is not None})
+    return Server("token-savior-recall", **rappels)
 async def main():
     # Aucun projet configure ? On en cherche, plutot que de demarrer aveugle.
     # Ici et pas a l'import : `_register_roots` tourne au niveau module, donc
@@ -1487,12 +1608,24 @@ async def main():
     # est confine a ce point d entree -- les clients CLI (qui importent
     # _dispatch_tool depuis le module) ne payent jamais ce cout.
     from mcp.server.stdio import stdio_server
-    server = s.get_server()
-    server.list_tools()(list_tools)
-    server.call_tool()(call_tool)
+    if _sdk_mcp_majeur() >= 2:
+        server = _serveur_sdk2()
+    else:
+        server = s.get_server()
+        server.list_tools()(list_tools)
+        server.call_tool()(call_tool)
+        from token_savior.server_handlers import discipline
+
+        @server.list_prompts()
+        async def _ts_list_prompts():
+            return discipline.list_prompts()
+
+        @server.get_prompt()
+        async def _ts_get_prompt(name, arguments):
+            return discipline.get_prompt(name, arguments)
 
     # Observations as ts://obs/{id} resources (opt-out: TS_RESOURCES_DISABLED=1).
-    if os.environ.get("TS_RESOURCES_DISABLED", "").lower() not in ("1", "true", "yes"):
+    if _sdk_mcp_majeur() < 2 and os.environ.get("TS_RESOURCES_DISABLED", "").lower() not in ("1", "true", "yes"):
         try:
             from token_savior.server_handlers import resources as _res
 

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 from typing import Any
@@ -189,8 +190,23 @@ MAX_AUTODISCOVERED = 40
 
 
 def is_project_dir(path: str) -> bool:
+    """A marker makes a project, but an empty `.git` directory is not one.
+
+    Panne du 06/10/2026 : un `/tmp/.git` vide, laisse le 27/09 par un outil
+    interrompu, faisait de tout `/tmp` un depot. Chaque clone jetable y etait
+    rattache a /tmp, qui s'est fait indexer en entier (25 Mo de cache) par une
+    tache de nuit. Un vrai depot a un `HEAD` ; un worktree lie a un fichier
+    `.git`.
+    """
     try:
-        return any(os.path.exists(os.path.join(path, m)) for m in PROJECT_MARKERS)
+        for m in PROJECT_MARKERS:
+            p = os.path.join(path, m)
+            if m == ".git":
+                if os.path.isfile(p) or os.path.exists(os.path.join(p, "HEAD")):
+                    return True
+            elif os.path.exists(p):
+                return True
+        return False
     except OSError:
         return False
 
@@ -203,6 +219,17 @@ def project_root_of(path: str) -> str | None:
     checking only the directory being examined returns the vendored package as
     a project root before the walk ever reaches `node_modules`. Caught by
     `test_ne_remonte_pas_depuis_une_dependance_vendorisee`, not by reading.
+
+    The temp directory itself is never a project root, whatever it contains:
+    it is shared by every tool on the machine (see `is_project_dir`).
+
+    Neither is the home directory, even when it is a git repository (dotfiles,
+    a whole VPS under version control). It is a container of projects: a path
+    below it with no marker of its own belongs to its first-level subdirectory.
+    Measured 07/10/2026 on a VPS whose /root is a git repository: every
+    marker-less folder (/root/claude-chat, /root/mochi-trader…) resolved to
+    /root itself, a 10 000-file index capped and answering "not found", and
+    sessions started in /root registered it as their launch project.
     """
     try:
         cur = os.path.abspath(path)
@@ -212,10 +239,20 @@ def project_root_of(path: str) -> str | None:
         cur = os.path.dirname(cur)
     if SKIP_DIRS.intersection(cur.split(os.sep)):
         return None
+    temporaire = os.path.realpath(tempfile.gettempdir())
+    maison = os.path.realpath(os.path.expanduser("~"))
     seen: set[str] = set()
     while cur and cur not in seen and cur != os.path.dirname(cur):
         seen.add(cur)
-        if is_project_dir(cur):
+        reel = os.path.realpath(cur)
+        if reel == maison:
+            if reel == os.path.realpath(path if os.path.isdir(path) else os.path.dirname(path)):
+                return None
+            # Premier sous-dossier du dossier personnel sur le chemin demandé.
+            reste = os.path.relpath(os.path.realpath(path), maison).split(os.sep)[0]
+            enfant = os.path.join(cur, reste)
+            return enfant if reste not in ("", ".", "..") and os.path.isdir(enfant) else None
+        if reel != temporaire and is_project_dir(cur):
             return cur
         cur = os.path.dirname(cur)
     return None
@@ -381,7 +418,9 @@ def autodiscover_and_register() -> list[str]:
     Called from `main()` rather than at import, so unit tests never trigger it.
     Set `TOKEN_SAVIOR_AUTODISCOVER=0` to keep the old behaviour.
     """
+    s._memoriser_actif = True
     if os.environ.get("TOKEN_SAVIOR_AUTODISCOVER", "1") == "0":
+        _restaurer_dernier_actif(None)
         return []
 
     fresh: list[str] = []
@@ -420,7 +459,49 @@ def autodiscover_and_register() -> list[str]:
         print(f"[token-savior] active project follows the launch worktree: "
               f"{cwd_root}", file=sys.stderr)
 
+    # Sans consigne explicite, le projet actif est celui du dossier de lancement.
+    # Mesure du 08/10/2026 (banc d'edition) : une session lancee dans une copie
+    # du depot gardait pour projet actif le premier WORKSPACE_ROOTS, l'original.
+    # Ses appels par nom de symbole lisaient l'original, et replace_symbol_source
+    # y a ecrit : l'edition « reussie » avait modifie un autre arbre.
+    # Un dossier sans marqueur sous le dossier personnel (/root/vps-remote) n'est
+    # pas un vrai projet : on y reprend d'abord le dernier projet actif retenu.
+    vrai_projet = bool(cwd_root) and is_project_dir(cwd_root)
+    _restaurer_dernier_actif(cwd_root if vrai_projet else None)
+    if (cwd_root and cwd_root in s._slot_mgr.projects and not _active_hint_source
+            and (vrai_projet or not _restaure)
+            and s._slot_mgr.active_root != cwd_root):
+        s._slot_mgr.active_root = cwd_root
+        print(f"[token-savior] active project = launch directory: {cwd_root}",
+              file=sys.stderr)
     return fresh
+
+
+_restaure = False
+
+
+def _restaurer_dernier_actif(cwd_root: str | None) -> None:
+    """Reprend le dernier projet actif de ce dossier de lancement.
+
+    Seulement quand rien de plus fiable n'a choisi : ni variable d'environnement
+    (CLAUDE_PROJECT_ROOT / CLAUDE_PROJECT_DIR) retenue, ni dossier de lancement
+    qui soit lui-même un projet. C'est le cas des sessions lancées depuis le
+    dossier personnel, dont chaque message Telegram.
+    """
+    if _active_hint_source or cwd_root:
+        return
+    from token_savior.slot_manager import dernier_actif
+    root = dernier_actif()
+    if not root:
+        return
+    if root not in s._slot_mgr.projects:
+        s._slot_mgr.register_roots([root])
+    if root in s._slot_mgr.projects:
+        global _restaure
+        _restaure = True
+        s._slot_mgr.active_root = root
+        print(f"[token-savior] active project restored from last session: {root}",
+              file=sys.stderr)
 
 
 _client_roots_synced = False
@@ -556,6 +637,7 @@ def _flush_stats(slot: _ProjectSlot, naive_chars: int) -> None:
             "tokens_used": s._total_chars_returned // 4,
             "tokens_naive": naive_chars // 4,
             "savings_pct": round(savings_pct, 2),
+            "naive_method": NAIVE_METHOD,
             "tool_counts": {
                 tool: count
                 for tool, count in s._tool_call_counts.items()
@@ -569,6 +651,14 @@ def _flush_stats(slot: _ProjectSlot, naive_chars: int) -> None:
         cum["total_calls"] = sum(entry.get("query_calls", 0) for entry in history)
         cum["total_chars_returned"] = sum(entry.get("chars_returned", 0) for entry in history)
         cum["total_naive_chars"] = sum(entry.get("naive_chars", 0) for entry in history)
+        # Totaux de la seule méthode actuelle : l'ancienne (fraction du projet)
+        # surestimait d'un ordre de grandeur, on ne l'additionne pas à la nouvelle.
+        v2 = [e for e in history if e.get("naive_method") == NAIVE_METHOD]
+        cum["naive_method"] = NAIVE_METHOD
+        cum["v2_since"] = min((e.get("timestamp") for e in v2), default=None)
+        cum["total_calls_v2"] = sum(e.get("query_calls", 0) for e in v2)
+        cum["total_chars_returned_v2"] = sum(e.get("chars_returned", 0) for e in v2)
+        cum["total_naive_chars_v2"] = sum(e.get("naive_chars", 0) for e in v2)
         aggregate_tool_counts: dict[str, int] = {}
         aggregate_client_counts: dict[str, int] = {}
         for entry in history:
@@ -724,20 +814,49 @@ def _count_and_wrap_result(
     return wrapped
 
 
+# Méthode d'estimation du coût « natif » d'un appel. 2 depuis le 07/10/2026 :
+# l'alternative réelle (Read du fichier, ou Grep) au lieu d'une fraction du
+# projet entier. Les totaux ne mélangent jamais les deux méthodes.
+NAIVE_METHOD = 2
+
+# Outils dont l'alternative native est de lire le fichier qui porte le symbole.
+_OUTILS_SYMBOLE = {
+    "get_function_source", "get_class_source", "find_symbol", "get_full_context",
+    "get_edit_context", "get_dependencies", "get_dependents", "get_change_impact",
+    "get_call_chain",
+}
+# Outils dont l'alternative native est de lire le fichier entier.
+_OUTILS_FICHIER = {"get_structure_summary", "get_functions", "get_classes", "get_imports"}
+
+
 def _estimate_naive_chars_for_call(
     slot: _ProjectSlot, tool_name: str, arguments: dict[str, Any], result: object
 ) -> int:
-    """Estimate the naive character cost of one tool call."""
+    """Ce que l'appel aurait coûté par la route native, en caractères.
+
+    Jusqu'au 07/10/2026, l'estimation par défaut était une fraction du projet
+    entier (15 % pour search_codebase, 30 % pour get_full_context) : sur un
+    projet de 4 Mo, une recherche « évitait » 600 000 caractères. D'où le
+    « 98,7 % d'économie » de `ts gain`, alors que le banc A/B du même jour
+    mesurait -14 % de coût et -25 % de jetons neufs.
+
+    Désormais l'alternative est celle qu'un agent prendrait vraiment : lire le
+    fichier qui porte le symbole (outils de symbole), lire le fichier entier
+    (outils de structure), ou Grep / Read borné, qui coûtent autant que la
+    réponse (recherche, lecture de plage) : là, aucune économie revendiquée.
+    """
+    rendu = len(_format_result(result))
     index = slot.indexer._project_index if slot.indexer else None
     if index is None:
-        return 0
+        return rendu
 
-    source_chars = sum(meta.total_chars for meta in index.files.values())
     file_sizes = {path: meta.total_chars for path, meta in index.files.items()}
 
     def size_for(paths: list[str]) -> int:
         total = 0
         for path in paths:
+            if not path:
+                continue
             resolved = (
                 path
                 if path in file_sizes
@@ -747,37 +866,50 @@ def _estimate_naive_chars_for_call(
                 total += file_sizes[resolved]
         return total
 
+    def fichier_du_symbole() -> str | None:
+        if isinstance(result, dict):
+            for cle in ("file", "file_path"):
+                if isinstance(result.get(cle), str):
+                    return result[cle]
+            loc = result.get("location") or result.get("symbol")
+            if isinstance(loc, dict) and isinstance(loc.get("file"), str):
+                return loc["file"]
+        if isinstance(arguments.get("file_path"), str):
+            return arguments["file_path"]
+        nom = arguments.get("name") or arguments.get("symbol_name")
+        table = getattr(index, "symbol_table", None) or {}
+        cible = table.get(nom) if isinstance(nom, str) else None
+        if isinstance(cible, str):
+            return cible
+        if isinstance(cible, dict) and isinstance(cible.get("file"), str):
+            return cible["file"]
+        return None
+
     is_ckpt_create = tool_name == "checkpoint" and (arguments.get("op") or "list") == "create"
     if tool_name in {"summarize_patch_by_symbol", "build_commit_summary"} or is_ckpt_create:
         changed_files = arguments.get("changed_files") or arguments.get("file_paths") or []
-        return max(size_for(changed_files), len(_format_result(result)))
+        return max(size_for(changed_files), rendu)
 
     if tool_name in {"replace_symbol_source", "insert_near_symbol"} and isinstance(result, dict):
-        target_file = result.get("file")
-        return max(size_for([target_file]) * 2 if target_file else 0, len(_format_result(result)))
+        # Route native : Read du fichier (exigé avant Edit), puis l'Edit lui-même.
+        return max(size_for([result.get("file")]), rendu)
 
     if tool_name in {"run_impacted_tests", "find_impacted_test_files"} and isinstance(result, dict):
         selection = result.get("selection") or result
         impacted = selection.get("impacted_tests", [])
         changed = selection.get("changed_files", [])
-        return max(size_for(impacted + changed), len(_format_result(result)))
-
-    if tool_name == "apply_symbol_change_and_validate" and isinstance(result, dict):
-        edit = result.get("edit", {})
-        file_path = edit.get("file")
-        validation = result.get("validation", {})
-        impacted = validation.get("selection", {}).get("impacted_tests", [])
-        return max(
-            size_for(([file_path] if file_path else []) + impacted) * 2, len(_format_result(result))
-        )
+        return max(size_for(impacted + changed), rendu)
 
     is_ckpt_compare = tool_name == "checkpoint" and (arguments.get("op") or "list") == "compare"
     if (tool_name == "get_changed_symbols" or is_ckpt_compare) and isinstance(result, dict):
         files = [entry.get("file") for entry in result.get("files", []) if entry.get("file")]
-        return max(size_for(files), len(_format_result(result)))
+        return max(size_for(files), rendu)
 
-    multiplier = _TOOL_COST_MULTIPLIERS.get(tool_name, 0.10)
-    return max(int(source_chars * multiplier), len(_format_result(result)))
+    if tool_name in _OUTILS_SYMBOLE:
+        return max(size_for([fichier_du_symbole()]), rendu)
+    if tool_name in _OUTILS_FICHIER and isinstance(arguments.get("file_path"), str):
+        return max(size_for([arguments["file_path"]]), rendu)
+    return rendu
 
 
 # ---------------------------------------------------------------------------

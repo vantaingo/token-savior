@@ -44,6 +44,9 @@ def is_path_excluded_from_scans(path: str) -> bool:
 
 def _rebuild_path_indexes(idx: ProjectIndex) -> None:
     """Refresh sorted_paths and basename_map after idx.files mutates."""
+    # Sole funnel for every mutation of idx.files, so bumping here makes the
+    # counter advance exactly when (and as often as) the file set changes.
+    idx.files_version += 1
     idx.sorted_paths = sorted(idx.files.keys())
     bmap: dict[str, list[str]] = {}
     for path in idx.sorted_paths:
@@ -208,6 +211,8 @@ class ProjectIndexer:
             "**/*.tsx",
             "**/*.js",
             "**/*.jsx",
+            "**/*.mjs",
+            "**/*.cjs",
             "**/*.go",
             "**/*.rb",
             "**/*.rs",
@@ -991,7 +996,7 @@ class ProjectIndexer:
             return self._resolve_python_import(module_path, all_files, is_from_import, names)
 
         single: str | None = None
-        if ext in (".ts", ".tsx", ".js", ".jsx"):
+        if ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
             single = self._resolve_ts_import(importing_file, module_path, all_files)
         elif ext == ".rs":
             single = self._resolve_rust_import(importing_file, module_path, all_files)
@@ -1152,7 +1157,7 @@ class ProjectIndexer:
         - Relative paths: './utils' -> try utils.ts, utils.tsx, utils/index.ts, etc.
         - Path aliases: '@/lib/utils' -> try src/lib/utils.ts, etc.
         """
-        extensions = [".ts", ".tsx", ".js", ".jsx"]
+        extensions = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]
 
         if module_path.startswith("."):
             # Relative import

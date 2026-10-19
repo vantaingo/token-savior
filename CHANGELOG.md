@@ -1,6 +1,317 @@
 # Changelog
 
-## Unreleased — Reading by line number
+## Unreleased — Fork fixes
+
+Fixes carried by this fork on top of upstream, not yet released.
+
+- **C# types declared with Allman braces are indexed.** `_TYPE_RE` required
+  `{`, `;` or `where` on the declaration line, so a `class` / `struct` /
+  `interface` / `enum` / `record` whose opening brace sits on the next line —
+  the default .NET style, and what `dotnet new` generates — was missing from
+  the index, and its methods surfaced as top-level functions
+  (`find_symbol` answered "not found", `get_function_source` rendered a
+  Python-style stub). End of line, optionally after a `//` comment, now ends a
+  declaration; `_find_type_end` already handled the next-line brace. Still not
+  covered: positional records whose parameter list spans several lines, and
+  properties.
+- **C# has a dependency graph.** `csharp_annotator` returned no
+  `dependency_graph`, and C# `using` lines name namespaces, not types, so the
+  project-level pass that scans bodies for imported names had nothing to match.
+  C# methods were therefore not even nodes of the global graph:
+  `get_call_chain` answered "not found in dependency graph" for names
+  `find_symbol` resolved, and callers, impact, dead code and entry points were
+  empty. The annotator now emits candidate edges per method — same-class and
+  inherited calls, `base.X()`, `new T(...)`, calls through fields, properties,
+  parameters, primary-constructor parameters and typed locals, static calls,
+  `is` / `as` / `typeof` — and the global graph keeps those that name a project
+  symbol. An interface method call also reaches its implementations, through
+  the same hierarchy pass Java uses. Comments and string literals are blanked
+  first. `_CACHE_VERSION` goes 3 → 4 so cached `.cs` metadata is rebuilt (5
+  after the upstream v4.24.0 merge, which had its own bump to 4). Not
+  covered: nested types, extension methods, `using static` and alias
+  resolution, overload resolution by arity, lambdas, expression-bodied
+  properties and interpolated-string holes.
+- **`get_call_chain` no longer links same-name methods of unrelated classes.**
+  Found by the first real C# repo to run #4: `Store.CaptureAsync`
+  calls its own private `OpenAsync`, and the chain still ended in
+  `SqlRepository.OpenAsync`. The graph was right; the search
+  was not. Every method matched through its bare name (`OpenAsync`), so two
+  classes with a private helper of the same name were the same node, and the
+  target also stood for all the sibling methods of its class. A method's bare
+  name now stands for it only when the graph is itself keyed by bare names
+  (Go, top-level functions), and only a constructor stands for its class.
+  Applies to every language. Still over-approximate: a class met on the way is
+  expanded to all its methods, so `A.run` that merely depends on type `B` can
+  still be shown reaching any `B` method.
+- **An ambiguous function name lists its candidates.** `function 'X' is
+  ambiguous` said nothing about where to look, which is the normal case for an
+  interface method and its implementation. The error now carries `candidates`
+  (qualified name and file) and a `_suggestion`, as the class-ambiguity error
+  already did.
+- **Tool schemas no longer carry a top-level `anyOf`.** `_with_aliases()` turned
+  the `required` of every tool with argument aliases into a root
+  `anyOf: [{required: [canonical]}, {required: [alias]}]`. The Anthropic API
+  rejects `oneOf` / `allOf` / `anyOf` at the top of an `input_schema`, and
+  Claude Code answers by leaving the tool out, without any error: with the
+  `optimized` profile `ts_search`, `search_codebase`, `switch_project` and
+  `replace_symbol_source` were invisible (7 tools in `full`, adding
+  `get_edit_context`, `insert_near_symbol`, `set_project_root`). Since
+  `ts_search` carries the deferred discovery of hidden tools, `optimized`,
+  `tiny`, `code_mode` and `auto` all lost it. This reverses the `anyOf` design
+  of the alias entry below: aliased arguments now leave `required`, the alias
+  properties stay declared (so the SDK still accepts them), and the missing
+  argument is reported at dispatch, after normalization, by the existing
+  explicit error naming the canonical argument.
+- **`ts_search` honours its aliases.** It is routed before `_dispatch_tool`,
+  where aliases are normalized, so `ts_search(pattern=...)` searched for an
+  empty query; a missing `query` is now an explicit error too.
+- `_ARG_ALIASES` and `_normalize_arguments` were defined twice in `server.py`;
+  schemas were built from the first copy and dispatch used the second, which
+  alone knew `find_symbol(query=...)`. One copy remains.
+- **Path hints written with `/` reach the right project on Windows.**
+  `SlotManager.resolve` only treated a hint as a path when it held `os.sep`,
+  which is `\` on Windows. `switch_project("C:/dev/repo/.claude/worktrees/wt")`
+  therefore skipped the owning-project routing, and the repo name found inside
+  the hint (reverse containment) silently answered with the *parent* checkout:
+  `Already active 'repo'`, the worktree never indexed. `os.altsep` now counts
+  too. Hooks and JSON configs write `/`, so this was the common spelling.
+
+## v4.24.0 — Lighter edit context, architecture map, review prompts (2026-10-15)
+
+Ideas from two neighbouring tools, rebuilt on Token Savior's own index:
+[Ponytail](https://github.com/DietrichGebert/ponytail) (write the smallest
+complete change) and [graphify](https://github.com/Graphify-Labs/graphify)
+(rationale comments and graph communities as first-class context).
+
+- **`get_edit_context` is 29 % lighter.** Measured on 40 random symbols of
+  this repository: 209 644 -> 148 190 characters. The sibling list sent every
+  function of the file (up to half of the response: 7 161 of 14 272 characters
+  for a method of `query_api.py`) and its line numbers were all `null`, because
+  the field is `lines`, not `line`. It now keeps the 12 nearest siblings, with
+  their real line, and `siblings_total` when it cut.
+- **`why` in `get_edit_context`.** The comment block glued above a definition
+  (Python `#`, JSDoc `/** */`, `//`) is returned as `why`: the intent the
+  source alone does not state, such as a counter-intuitive rule nobody should
+  "fix". Section banners are ignored; capped at 8 lines.
+- **Architecture map in `get_project_summary`.** Two lines, from the graph the
+  index already holds and with no model call: the most depended-on symbols
+  (hubs) and the largest graph communities, named by their hub and by their
+  production directory. About 400 more characters, once per project.
+- **Three MCP prompts**: `review` (the change, including breakage outside the
+  diff through `get_change_impact` and `detect_breaking_changes`), `audit` (the
+  whole project, ranked must / should / nice to have) and `lean` (a task as the
+  smallest complete change). Claude Code lists them as slash commands. Free
+  until called; `TS_PROMPTS=0` removes them.
+- **Opt-in session instructions** (`TS_DISCIPLINE=1`, 977 characters): the
+  smallest complete change scoped by `get_edit_context`, a reuse ladder that
+  checks the codebase first (`search_codebase` with `semantic=true`), deletion
+  before addition, never cutting validation or security, one closing line on
+  what was skipped. Off by default because the benchmark below found a cost
+  and no gain.
+- **Benchmark, old vs new server** (tsbench, Sonnet, `auto` profile, real
+  repository): 28/28 sessions succeeded in both arms. With the instructions on,
+  cost per session was +3 % on editing (4 comparable sessions) and +4 % on
+  reading (7), the price of ~100 more cached tokens per session; code written
+  in editing fell 9 %, within noise. The first session of each arm was left
+  out: the arm that ran first paid the prompt-cache warm-up alone (11 851
+  cache-write tokens against ~2 200), which had produced a fake -18 %. These
+  tasks take 2 to 4 turns and barely call `get_edit_context`, so they cannot
+  show its 29 % reduction, measured directly instead.
+- Both SDK generations: tested with MCP 1.27 and 2.3 through a real stdio
+  handshake. Options a SDK does not know are not passed.
+
+## v4.23.2 — The launch directory is the active project (2026-10-08)
+
+- **Fix: a session could edit another project.** Started in a project that was
+  not the first `WORKSPACE_ROOTS` entry, the server registered the launch
+  directory but kept the first root as the active project. Calls by symbol name
+  or relative path then answered from that other tree, and
+  `replace_symbol_source` wrote into it while reporting success. Found by the
+  new editing benchmark, whose session in a copy of a repository rewrote the
+  original. The launch directory now becomes the active project unless
+  `CLAUDE_PROJECT_ROOT` / `CLAUDE_PROJECT_DIR` says otherwise; a marker-less
+  folder under the home directory still restores its last active project first.
+- **Editing benchmark on a real repository** (3 tasks in files of 1 900 to
+  3 700 lines, graded by running code and the module's tests, 4 passes).
+  Every session of both arms succeeded. Cost is too noisy to call a gain
+  (passes from -54 % to +16 %). Native `Edit` only needs a partial `Read`, so
+  Token Savior has little to remove there.
+- `edit_lines_in_symbol` was tried in the `auto` profile and taken back out: on
+  a rename it led the model to one call per function (23 turns, $0.21) instead
+  of one `Edit` with `replace_all` (6 turns, $0.04). Its description is
+  clearer and it now has its own tests; it stays callable via `ts_execute`.
+
+## v4.23.1 — Smaller session start, reachable tools (2026-10-07)
+
+- **SessionStart memory index trimmed by 57 %** (2 990 -> 1 295 characters on
+  the author's base, 30 -> 12 observations). Only guardrails, warnings and
+  decisions; observations younger than 14 days first; automatic traces
+  (`chmod`, `restart`…) excluded; Continuity and Tool Capture on one short line.
+  Tunable: `TS_SESSION_INDEX_MAX`, `TS_SESSION_INDEX_TYPES`,
+  `TS_SESSION_INDEX_RECENT_DAYS`, `TS_SESSION_INDEX_EXCLUDE`, `TS_SESSION_LINE_MAX`.
+- **`move_symbol` and `checkpoint` callable from `ts_execute`.** The `auto`
+  profile no longer lists them, and the sandbox allowlist did not have them
+  either, so they had become unreachable. A test now checks that every tool
+  dropped from the profile stays reachable through `ts_execute`.
+- **Benchmark variance.** Three passes of the v4.23.0 measurement: cost
+  -45 % ± 7 (range -39 % to -53 %), new tokens -59 % ± 6, wall time +40 %,
+  Token Savior used in 23 sessions of 24. On 3 editing tasks (one pass) both
+  arms succeed 3/3 with no measurable gain yet.
+- Ops note: the index cache key includes `EXCLUDE_EXTRA`. Two processes sharing
+  a project with different values (a daemon and a Claude Code session, say)
+  invalidate each other's cache and rebuild the whole index on every switch.
+  Give them the same value.
+
+## v4.23.0 — Beat Grep where the model reaches for it (2026-10-07)
+
+Same benchmark as v4.22.0 (tsbench `--reel`, Haiku, 8 tasks, same evening),
+three arms:
+
+| | cost | new tokens | sessions using TS | wall time |
+|---|---|---|---|---|
+| no Token Savior | 0.234 $ | 99 993 | — | 134 s |
+| v4.22.0 `auto` | 0.202 $ (-14 %) | 75 470 | 5/8 | 195 s |
+| v4.23.0 `auto` | **0.129 $ (-45 %)** | **43 660 (-56 %)** | **8/8** | 210 s |
+
+One pass per task, variance not measured. Wall time is still higher than the
+baseline: each benchmark session starts a fresh server that indexes the repo.
+
+- **`search_codebase` names the symbol containing each hit (`in`).** "Who
+  calls X" is answered in one call; Grep cannot do that, and that is where
+  the model kept choosing Grep.
+- **`read_lines` names the symbol holding the first line** when none covers
+  the whole range. "Which function is line 145 in" took three reads: the
+  default 60-line window spilled into the next function and no name came out.
+- **Descriptions of `search_codebase`, `find_symbol`, `get_function_source`
+  and `read_lines` rewritten** around what they do better than Grep and Read
+  (+37 tokens on the manifest).
+- **`ts gain` and the dashboard stop inflating savings.** The native cost of
+  a call was a fraction of the whole project (15 % for a search, 30 % for
+  `get_full_context`), hence "98.7 % saved". It is now the real alternative:
+  the file holding the symbol, the whole file for structure tools, and as
+  much as the answer for a search or a line range. Sessions carry their
+  method (`naive_method=2`); only that method is summed, and the output
+  recalls the end-to-end measurement.
+- **Memory hooks: no more `chmod`/`restart` traces, nothing injected off
+  topic.** Over 7 days, 83 % of memories injected with each prompt were
+  automatic traces ("chmod on …", "restart …"), 13.5 % shared a meaningful
+  word with the prompt, and none was cited or recalled by the model.
+  `memory-posttooluse.sh` no longer captures `systemctl start|restart|…` or
+  `chmod|chown`; `memory-userprompt.sh` injects only non-trace memories that
+  share a 5+ letter word with the prompt, and nothing otherwise.
+- **Discipline guard matcher** now sends `get_function_source`,
+  `get_class_source` and `ts_execute` to the guard, so reading a symbol counts
+  as context as v4.22.0 intended; a test keeps matcher and rule aligned.
+
+## v4.22.0 — What real usage said (2026-10-07)
+
+Every change below answers a failure counted in real transcripts (765 sessions
+over 30 days, then a second pass), not a hypothesis. Measured on this
+project's own A/B benchmark (tsbench `--reel`, Haiku, same evening): with the
+`auto` profile, 8/8 tasks solved like the baseline, cost -14 %, new tokens
+-25 %, wall time +45 %. One pass per task, variance not measured.
+
+### Second pass on real usage (07/10/2026)
+
+- **`ts_execute` results are capped** at 60 000 characters
+  (`TS_EXECUTE_MAX_CHARS`). A script that read four whole files returned
+  57 545, which Claude Code refused and parked in a file: the script ran for
+  nothing. The returned value is cut, logs and counters kept, and the cut is
+  reported.
+- **README: `"alwaysLoad": true`** in the Claude Code snippet. Without it every
+  tool sits behind ToolSearch and the model reaches for `Read` and `Grep`.
+- **`get_function_source` / `get_class_source` return the source again.**
+  Without an explicit `level`, a Thompson-sampling bandit picked the detail
+  level and scored every non-empty answer a success, a `[L2]` summary
+  included; a re-request with an explicit `level` recorded nothing, so no
+  failure was ever counted. It had drifted to 5 284 successes for `[L2]`
+  against 34 for the full source: over 30 days, 61 of 95 calls without
+  `level` returned a summary or a bare signature instead of the code asked
+  for. Full source is now the default; the bandit only runs with
+  `TS_LEVEL_BANDIT=1`.
+- **The home directory is a container, never a project.** A home that is
+  itself a git repository (a VPS under version control) made every
+  marker-less folder below it — `/root/claude-chat`, `/root/gmgn-api`… —
+  resolve to the whole home: a 10 000-file index, capped, answering
+  "not found". Such a path now belongs to its first-level subdirectory, and
+  a session launched from home no longer registers home as its project.
+- **The active project survives a server restart.** Each Telegram message
+  starts a fresh `claude -p`, hence a fresh MCP server whose active project
+  fell back to the first configured root. The last project made active is
+  now remembered per launch directory and restored when nothing more
+  reliable (environment hint, launch directory that is a project) chose.
+- **The over-exploration hint stops repeating.** Past 15 navigation calls in
+  a server's life (sub-agents included), ~340 identical characters were
+  appended to every answer. It now shows at the threshold, then every 25
+  calls.
+- **Leaner `auto` manifest: 18 → 13 tools, ~4 160 → ~3 220 tokens.**
+  `move_symbol` (0 calls in 30 days), `ts_search` (1) and `get_git_status`
+  (11) leave the always-on set; `set_project_root` and `get_functions` are
+  never promoted (`switch_project` and `get_structure_summary` already do
+  their job). All stay callable by name and from `ts_execute`. Hot slots
+  10 → 8 (`TS_AUTO_HOT_K`).
+- `test_vector_distance_floor` skips when the vector stack is half
+  installed (fastembed without sqlite-vec made `vec_search_rows` return
+  `[]` silently, read as a recall defect).
+
+### What 30 days of real calls said (06/10/2026)
+
+Audit of 765 transcripts (3 569 Token Savior calls) and of the discipline
+guard's own log. Every change below answers a measured failure, counted in
+the commit that fixes it.
+
+- **`.mjs` and `.cjs` are indexed.** Every `get_functions` miss and most
+  `read_lines` misses were on ES modules (`launchpad/pump.mjs`,
+  `runtime/cycle-reconciler.mjs`): the include patterns stopped at `.js`/`.jsx`.
+  Imports between them resolve, editing works. Index cache version bumped to 4.
+- **Constants have a context.** `find_symbol` with default kinds now falls
+  back to variables on a miss instead of answering `retry_with`; the
+  TypeScript/JavaScript annotator records top-level `const`/`let`/`var`
+  bindings (it recorded none); `get_full_context` and `get_edit_context`
+  return the binding's source (new `get_variable_source`, brackets balanced)
+  instead of "function 'X' not found". Half of the `get_edit_context`
+  failures were `export const` tables.
+- **`read_lines` reads files outside the index** — absolute, or relative to
+  the active root; regular text files under 5 MB, no binaries — and says so.
+  17 of its 19 failures were files that existed on disk.
+- **`search_codebase(max_results=0)` is cut at 60 000 characters** with a
+  `_tronque` note. Five such calls returned 107-192 k characters, which
+  Claude Code refuses.
+- **`ts_execute` accepts `code` (and `body`, `js`) for `script`.** 8 of its 30
+  failures. The two homonymous `_ARG_ALIASES` tables in `server.py` had
+  diverged (schema read one, dispatch the other); merged into one.
+- **"Found in project" no longer sticks to successful reads.** The footer
+  fired whenever the returned *text* contained "not found in index"; reading
+  the handler that emits it was enough, and the footer ended up pasted into
+  the source by a `replace_symbol_source`.
+- **An empty `.git` directory is not a project, and the temp directory never
+  is.** A stray `/tmp/.git` (empty, 27/09) made `/tmp` a repository, so every
+  scratch clone resolved to `/tmp`, which a nightly job indexed whole
+  (25 MB cache).
+- **MCP SDK 2.x and protocol 2026-07-28.** Claude Code negotiates the
+  2026-07-28 protocol on stdio by default since 2.1.292; a server that does
+  not answer it pays a slow connect, then seven days remembered in the old
+  mode. The 2.x SDK serves both eras in one loop but dropped the
+  `list_tools()`/`call_tool()` decorators, so the server crashed at start
+  under it. `main()` now builds the server with the 2.x callbacks when that
+  SDK is installed and keeps the 1.x path otherwise; the pin is `mcp>=1.25,<3`.
+  Checked over stdio: 2.x server answers 2026-07-28 to a modern client and
+  2025-11-25 to a 1.x one.
+- **Discipline guard, recalibrated on its own log** (30 days):
+  - native `Edit`/`Write` on indexed code is now advice, logged as
+    `conseil`, never denied: 303 of 305 refusals were re-issued identically
+    within five minutes;
+  - native `Read` is refused only whole-file and over 200 lines
+    (`TS_GUARD_READ_FREE_LINES`): 78 % of refused Reads were re-issued, and
+    Claude Code's `Edit` requires a prior `Read`;
+  - `insert_near_symbol` no longer needs the anchor's context (26 of 29
+    refusals were on an anchor that is not modified);
+  - `get_function_source`, `get_class_source` and `ts_execute` scripts
+    calling the context tools count as context; a symbol edited once can be
+    edited again;
+  - a marker at `/` or in the temp directory no longer makes a project.
+
+### Reading by line number
 
 An audit of 1 047 real code reads done in Bash rather than through this server
 found that 93,2 % never tried a tool at all (only 1,4 % were repairs after a
@@ -28,51 +339,8 @@ surface asked for a symbol name.
   failed precisely where the need is most common, and the next hint-less call
   silently answered from the wrong repository. Default behaviour is unchanged
   (promotion still happens with the flag off).
-- **C# types declared with Allman braces are indexed.** `_TYPE_RE` required
-  `{`, `;` or `where` on the declaration line, so a `class` / `struct` /
-  `interface` / `enum` / `record` whose opening brace sits on the next line —
-  the default .NET style, and what `dotnet new` generates — was missing from
-  the index, and its methods surfaced as top-level functions
-  (`find_symbol` answered "not found", `get_function_source` rendered a
-  Python-style stub). End of line, optionally after a `//` comment, now ends a
-  declaration; `_find_type_end` already handled the next-line brace. Still not
-  covered: positional records whose parameter list spans several lines, and
-  properties.
-- **C# has a dependency graph.** `csharp_annotator` returned no
-  `dependency_graph`, and C# `using` lines name namespaces, not types, so the
-  project-level pass that scans bodies for imported names had nothing to match.
-  C# methods were therefore not even nodes of the global graph:
-  `get_call_chain` answered "not found in dependency graph" for names
-  `find_symbol` resolved, and callers, impact, dead code and entry points were
-  empty. The annotator now emits candidate edges per method — same-class and
-  inherited calls, `base.X()`, `new T(...)`, calls through fields, properties,
-  parameters, primary-constructor parameters and typed locals, static calls,
-  `is` / `as` / `typeof` — and the global graph keeps those that name a project
-  symbol. An interface method call also reaches its implementations, through
-  the same hierarchy pass Java uses. Comments and string literals are blanked
-  first. `_CACHE_VERSION` goes 3 → 4 so cached `.cs` metadata is rebuilt. Not
-  covered: nested types, extension methods, `using static` and alias
-  resolution, overload resolution by arity, lambdas, expression-bodied
-  properties and interpolated-string holes.
-- **`get_call_chain` no longer links same-name methods of unrelated classes.**
-  Found by the first real C# repo to run #4: `Store.CaptureAsync`
-  calls its own private `OpenAsync`, and the chain still ended in
-  `SqlRepository.OpenAsync`. The graph was right; the search
-  was not. Every method matched through its bare name (`OpenAsync`), so two
-  classes with a private helper of the same name were the same node, and the
-  target also stood for all the sibling methods of its class. A method's bare
-  name now stands for it only when the graph is itself keyed by bare names
-  (Go, top-level functions), and only a constructor stands for its class.
-  Applies to every language. Still over-approximate: a class met on the way is
-  expanded to all its methods, so `A.run` that merely depends on type `B` can
-  still be shown reaching any `B` method.
-- **An ambiguous function name lists its candidates.** `function 'X' is
-  ambiguous` said nothing about where to look, which is the normal case for an
-  interface method and its implementation. The error now carries `candidates`
-  (qualified name and file) and a `_suggestion`, as the class-ambiguity error
-  already did.
 
-## Unreleased — One server, many worktrees, no stolen calls
+### One server, many worktrees, no stolen calls
 
 Parallel agents in sibling worktrees shared one server and one mutable
 `active_root`, and the worktree a session actually worked in was often never
@@ -106,33 +374,6 @@ spawn cwd carries its signal.
 - Hooks and the standalone CLI now fall back `CLAUDE_PROJECT_ROOT` →
   `CLAUDE_PROJECT_DIR` → `$PWD`; the session-start memory hook previously
   read only the first, which no host sets, and ran with an empty project.
-- **Tool schemas no longer carry a top-level `anyOf`.** `_with_aliases()` turned
-  the `required` of every tool with argument aliases into a root
-  `anyOf: [{required: [canonical]}, {required: [alias]}]`. The Anthropic API
-  rejects `oneOf` / `allOf` / `anyOf` at the top of an `input_schema`, and
-  Claude Code answers by leaving the tool out, without any error: with the
-  `optimized` profile `ts_search`, `search_codebase`, `switch_project` and
-  `replace_symbol_source` were invisible (7 tools in `full`, adding
-  `get_edit_context`, `insert_near_symbol`, `set_project_root`). Since
-  `ts_search` carries the deferred discovery of hidden tools, `optimized`,
-  `tiny`, `code_mode` and `auto` all lost it. This reverses the `anyOf` design
-  of the alias entry below: aliased arguments now leave `required`, the alias
-  properties stay declared (so the SDK still accepts them), and the missing
-  argument is reported at dispatch, after normalization, by the existing
-  explicit error naming the canonical argument.
-- **`ts_search` honours its aliases.** It is routed before `_dispatch_tool`,
-  where aliases are normalized, so `ts_search(pattern=...)` searched for an
-  empty query; a missing `query` is now an explicit error too.
-- `_ARG_ALIASES` and `_normalize_arguments` were defined twice in `server.py`;
-  schemas were built from the first copy and dispatch used the second, which
-  alone knew `find_symbol(query=...)`. One copy remains.
-- **Path hints written with `/` reach the right project on Windows.**
-  `SlotManager.resolve` only treated a hint as a path when it held `os.sep`,
-  which is `\` on Windows. `switch_project("C:/dev/repo/.claude/worktrees/wt")`
-  therefore skipped the owning-project routing, and the repo name found inside
-  the hint (reverse containment) silently answered with the *parent* checkout:
-  `Already active 'repo'`, the worktree never indexed. `os.altsep` now counts
-  too. Hooks and JSON configs write `/`, so this was the common spelling.
 
 ## v4.21.0 — The server stops keeping what it knows to itself (2026-07-28)
 
